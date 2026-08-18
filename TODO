@@ -1,0 +1,99 @@
+# Nano-vLLM 当前 TODO
+
+状态以当前代码和已有测试覆盖为准；2026-08-18 已使用 Qwen3-0.6B
+在 GPU 1、2、3、4 上完成长上下文和组合并行实测。
+
+- `[x]` 已实现，且有对应代码或测试覆盖。
+- `[~]` 已有教学版/部分覆盖，但未达到原始目标的完整范围。
+- `[ ]` 尚未实现。
+
+详细实现方案、限制与验收条件见 `nanovllm/tasks.md`。
+
+## 已完成或已有教学版
+
+### P0. 测试基础设施
+
+- [x] `tests/`、独立子进程、timeout、GPU 空闲门禁和文件锁。
+- [x] 每次运行使用唯一 `master_port`、`run_id` 和共享内存名，并支持幂等退出。
+- [x] `temperature=0` 的 greedy sampling；单测验证结果稳定。
+- [~] 分布式诊断包含 rank、并行 rank、设备、参数字节数、KV cache 层数和通信计数；
+      尚未形成完整的显存、group 成员和吞吐回归报告。
+- [ ] 固定 HF Transformers logits/token IDs oracle，以及所有 rank 的完整显存、group
+      成员和吞吐回归报告。
+
+### P1. Tensor Parallelism
+
+- [x] 显式 `parallel_state`，暴露 TP/PP/EP rank 与 world size。
+- [x] Qwen3 dense 的 vocab、QKV、MLP 等 TP shard 和 TP collective。
+- [x] Qwen3-0.6B 的 TP=2/4 greedy token IDs 对比 TP=1 的测试；TP=4 已在 GPU 1、2、3、4
+      实际运行通过。
+- [ ] Qwen3-8B TP=1/2/4 的显存与 logits 集成验收。
+- [ ] Qwen3-32B TP=4 的端到端集成验收。
+- [~] DP/TP/PP 的教学版 process groups 已可用；CP 仍没有独立 group，完整多维并行
+      上下文和 CP correctness 尚未实现。
+
+### P2. Prefix Cache 与 Chunked Prefill
+
+- [x] 完整 KV block 的 prefix reuse、hash 命中统计和陈旧 hash 清理。
+- [x] prefix cache 开关下的单卡输出一致性测试。
+- [x] 按 `max_num_batched_tokens` 切分单 sequence 的 chunked prefill。
+- [x] 原目标中的 1024-token prefix、8192-token prompt、TP=4 集成测试（Qwen3-0.6B）。
+      1024-token prefix 命中复用 1024 tokens；8192 prompt 的 8×1024 chunk 与单次
+      prefill 输出一致。
+- [ ] 多请求 prefill batching，以及 decode 与长 prefill 的公平并行推进。
+- [ ] 使用fused-moe kernel进行加速
+
+### P3. PP 与 DP
+
+- [x] PP=2、TP=1 的连续 layer 切分；首 stage embedding、末 stage norm/LM head。
+- [x] 相邻 PP stage 同步传递 `hidden_states + residual`，末 stage token 回传 rank 0。
+- [x] 每个 PP stage 只加载本地层和本地 KV cache；PP=2 输出对比测试。
+- [x] 教学 DP=2：独立 replica engine、round-robin prompt 路由和原顺序合并。
+- [ ] PP-aware 调度、多个 in-flight microbatch、流水填充和异步 P2P。
+- [ ] PP=4、Qwen3-32B 集成验收。
+- [x] TP=2+PP=2 组合并行；Qwen3-0.6B 在 GPU 1、2、3、4 上通过 token IDs、层切分和
+      TP/PP group 检查。
+- [x] DP=2+TP=2 组合并行；两个 DP replica 各运行 TP=2，输出与单卡 batch baseline 一致。
+
+### P4. MoE 与 EP
+
+- [x] 模型注册表按 `AutoConfig.model_type` 区分 Qwen3 dense 与 Qwen3-MoE。
+- [x] Qwen3-MoE router、FP32 softmax/top-k、本地 expert 权重加载和加权输出。
+- [x] EP=1/2：连续 expert 切分，每 rank 仅加载本地 expert 权重，随后
+      `all_reduce(SUM)` 合并局部输出。
+- [x] MoE router 数学、expert 权重分片和 EP=2 对比 EP=1 的测试代码。
+- [ ] 真实 token all-to-all dispatch/combine；当前所有 EP rank 复制 token 和 router。
+- [ ] fused/grouped expert GEMM；当前逐 expert Python loop 和多个 `F.linear`。
+- [ ] shared experts、expert capacity/token dropping、EPLB 或动态 expert placement。
+- [ ] EP=4 回归，以及 EP 与 TP/PP 的组合。
+
+### P5. Speculative Decoding
+
+- [x] greedy proposal verification 的接受前缀与 replacement token 单元测试。
+- [ ] 独立 target/draft 模型、tokenizer/vocab 校验、draft proposal。
+- [ ] target 批量验证、KV checkpoint/rollback 和完整 engine integration。
+- [ ] speculative 输出与 target-only 输出一致性的端到端测试和加速指标。
+
+### P6. Context Parallelism
+
+- [ ] 独立 CP group、全局 position/local KV 映射和跨 rank causal attention。
+- [ ] 长 prefill CP，以及 CP=2 logits/token correctness 测试。
+- [ ] decode CP。
+
+### P7. Quantization
+
+- [ ] 加入量化推理
+
+## 当前主要限制
+
+- [~] `TP + PP` 和 `DP + TP` 已有教学版 2+2 实现并实测；`TP + EP`、`PP + EP` 等
+      MoE 组合仍未完成。
+- [ ] PP 是同步单 microbatch 实现，不会填充推理流水线。
+- [ ] MoE EP 不是生产级 all-to-all 实现，也未使用 fused MoE kernel。fused MoE kernel应该支持triton和DeepGEMM两种常见kernel实现。
+- [ ] CUDA Graph 仅覆盖单卡/TP 的固定 batch decode；PP 与 EP 强制
+      `enforce_eager=True`。
+- [ ] 理解torch.compile与cuda.graph的作用
+
+## 最终目标
+- [ ] 在H200x4上接入一个Qwen3-Next-80B-A3B-Instruct model，并达到与vllm相当的TTFT和TPOT性能。
+- [ ] 在H200x4上接入一个deepseek-v4-flash-{quant} model，并达到与vllm相当的TTFT和TPOT性能。

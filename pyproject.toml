@@ -19,9 +19,25 @@ dependencies = [
     "xxhash",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+]
+
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = [
+    "unit: CPU-only unit test",
+    "single_gpu: requires idle physical GPU 1",
+    "multi_gpu: requires idle physical GPUs 2 and 3",
+    "slow: long-running integration test",
+]
+timeout = 180
