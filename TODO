@@ -70,9 +70,20 @@
 ### P5. Speculative Decoding
 
 - [x] greedy proposal verification 的接受前缀与 replacement token 单元测试。
-- [ ] 独立 target/draft 模型、tokenizer/vocab 校验、draft proposal。
-- [ ] target 批量验证、KV checkpoint/rollback 和完整 engine integration。
-- [ ] speculative 输出与 target-only 输出一致性的端到端测试和加速指标。
+- [x] Qwen3-8B + EAGLE3 独立 draft model 加载、配置/hidden-size/vocab 校验和
+      greedy draft proposal（最大 `k=8`）。
+- [x] 单请求 target verification、target/draft KV cache checkpoint/rollback 和
+      engine integration（eager、DP=TP=PP=1、关闭 prefix cache）。
+- [x] EAGLE3 `k=8` 与 target-only greedy token IDs 一致的端到端 GPU 测试。
+- [~] 多请求批量 EAGLE3 proposal、target verification、调度和 per-request draft
+      state；尚未实现 batch-invariant target kernels，BF16 下 batch composition 可改变
+      aux hidden states、greedy token 和 acceptance rate。
+- [ ] TP/PP/DP、CUDA graph、prefix cache，以及 probabilistic speculative sampling。
+- [x] acceptance rate、target-forward 数和吞吐加速指标；已完成 batch=1、
+      prompt=1024、response=256、`k=8`、temperature=0、CUDA Graph 开启时的
+      nano-vLLM/vLLM 对比测试，并记录 TTFT、TTPO、CPU/GPU profile 占比。
+- [ ] speculative target verification 的 CUDA Graph；当前 nano-vLLM 仅捕获常规
+      target decode 和 EAGLE draft graph，`forward_with_aux_hidden_states()` 仍为 eager。
 
 ### P6. Context Parallelism
 

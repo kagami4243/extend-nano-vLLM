@@ -4,6 +4,26 @@ from transformers import AutoConfig
 
 
 @dataclass
+class SpeculativeConfig:
+    method: str
+    model: str
+    num_speculative_tokens: int = 8
+    aux_hidden_state_layers: tuple[int, ...] = (2, 18, 33)
+    # Kept for compatibility with vLLM-style speculative configuration.
+    max_model_len: int | None = None
+
+    def __post_init__(self):
+        if self.method != "eagle3":
+            raise ValueError("only the eagle3 speculative method is supported")
+        if not os.path.isdir(self.model):
+            raise ValueError(f"speculative model path does not exist: {self.model}")
+        if not 1 <= self.num_speculative_tokens <= 8:
+            raise ValueError("num_speculative_tokens must be between 1 and 8")
+        if len(self.aux_hidden_state_layers) != 3:
+            raise ValueError("EAGLE3 requires exactly three auxiliary hidden layers")
+
+
+@dataclass
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
@@ -25,6 +45,7 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    speculative_config: SpeculativeConfig | dict | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -43,6 +64,20 @@ class Config:
             )
         assert self.device_offset >= 0
         assert self.max_num_batched_tokens > 0
+        if isinstance(self.speculative_config, dict):
+            self.speculative_config = SpeculativeConfig(**self.speculative_config)
+        if self.speculative_config is not None:
+            if not isinstance(self.speculative_config, SpeculativeConfig):
+                raise TypeError("speculative_config must be a SpeculativeConfig or dict")
+            if (
+                self.data_parallel_size != 1
+                or self.tensor_parallel_size != 1
+                or self.pipeline_parallel_size != 1
+            ):
+                raise ValueError(
+                    "EAGLE3 speculative decoding currently requires DP=TP=PP=1"
+                )
+            self.enable_prefix_caching = False
         self.hf_config = AutoConfig.from_pretrained(self.model)
         if self.hf_config.model_type == "qwen3_moe":
             assert self.enforce_eager, (

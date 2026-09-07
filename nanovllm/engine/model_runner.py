@@ -25,6 +25,7 @@ from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.models.eagle3 import Eagle3KVCache, load_eagle3_model
 
 
 class ModelRunner:
@@ -72,6 +73,22 @@ class ModelRunner:
             ep_size=self.ep_size,
         )
         load_model(self.model, config.model)
+        self.speculative_config = config.speculative_config
+        self.eagle3_model = None
+        # EAGLE stores only its recurrent hidden state here. Its physical KV
+        # pages are bound to attention layers below and reuse each sequence's
+        # block table, so scheduler rollback has one logical source of truth.
+        self.eagle3_states: dict[int, Eagle3KVCache] = {}
+        if self.speculative_config is not None:
+            if hf_config.model_type != "qwen3":
+                raise ValueError("EAGLE3 speculative decoding currently requires Qwen3")
+            self.eagle3_model = load_eagle3_model(self.speculative_config.model)
+            eagle_config = self.eagle3_model.config
+            if (
+                eagle_config.target_hidden_size != hf_config.hidden_size
+                or eagle_config.target_vocab_size != hf_config.vocab_size
+            ):
+                raise ValueError("EAGLE3 checkpoint is incompatible with the target Qwen3")
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -209,6 +226,32 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
         assert layer_id == num_local_layers
+        if self.eagle3_model is not None:
+            # Target and draft attention need separate values, but must use
+            # identical logical block IDs. This lets the scheduler reserve and
+            # roll back both caches by changing the one sequence block table.
+            eagle_layers = sum(
+                1 for module in self.eagle3_model.modules()
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache")
+            )
+            eagle_config = self.eagle3_model.config
+            self.eagle_kv_cache = torch.empty(
+                2,
+                eagle_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                eagle_config.num_key_value_heads,
+                eagle_config.head_dim,
+                dtype=eagle_config.torch_dtype,
+                device="cuda",
+            )
+            layer_id = 0
+            for module in self.eagle3_model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.eagle_kv_cache[0, layer_id]
+                    module.v_cache = self.eagle_kv_cache[1, layer_id]
+                    layer_id += 1
+            assert layer_id == eagle_layers
 
     def get_diagnostics(self):
         local = {
@@ -289,7 +332,9 @@ class ModelRunner:
                 slot_mapping.append(
                     seq.block_table[block_index] * self.block_size + block_offset
                 )
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if any(seq.block_table for seq in seqs):
+            if not all(seq.block_table for seq in seqs):
+                raise RuntimeError("mixed allocated and unallocated KV-cache batches")
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -313,8 +358,27 @@ class ModelRunner:
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.arange(
+            len(seqs) + 1, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        cu_seqlens_k = torch.zeros(
+            len(seqs) + 1, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        cu_seqlens_k[1:] = torch.cumsum(context_lens, dim=0)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        # Use the paged varlen kernel for decode as well as prefill.  This
+        # keeps the attention computation identical when speculative verify
+        # submits multiple query rows.
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=1,
+            max_seqlen_k=int(context_lens.max().item()),
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -342,6 +406,258 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+    @torch.inference_mode()
+    def run_target_with_aux(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        all_token_logits: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # EAGLE3 conditions its draft model on selected target-layer states.
+        # Return logits and auxiliary states from one target pass so proposal
+        # verification does not require a second target forward.
+        assert self.speculative_config is not None
+        hidden_states, aux_hidden_states = self.model.forward_with_aux_hidden_states(
+            input_ids,
+            positions,
+            self.speculative_config.aux_hidden_state_layers,
+        )
+        if all_token_logits:
+            return self.model.compute_all_logits(hidden_states), aux_hidden_states
+        return self.model.compute_logits(hidden_states), aux_hidden_states
+
+    @torch.inference_mode()
+    def initialize_eagle3_state(
+        self,
+        seq: Sequence,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        aux_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        assert self.eagle3_model is not None
+        state = Eagle3KVCache()
+        # EAGLE3 is conditioned on the target's next token and the current
+        # target auxiliary state. This is the same one-token shift vLLM uses.
+        eagle_input_ids = input_ids.clone()
+        if input_ids.numel() > 1:
+            eagle_input_ids[:-1] = input_ids[1:]
+        eagle_input_ids[-1] = next_token_ids.reshape(-1)[-1]
+        combined = self.eagle3_model.combine_hidden_states(aux_hidden_states)
+        draft_hidden_states, feedback_hidden_states = (
+            self.eagle3_model.forward_with_cache(
+                eagle_input_ids, positions, combined
+            )
+        )
+        state.last_hidden_state = draft_hidden_states[-1:]
+        state.last_feedback_hidden_state = feedback_hidden_states[-1:]
+        self.eagle3_states[seq.seq_id] = state
+
+    @torch.inference_mode()
+    def verify_eagle3_batch(
+        self, seqs: list[Sequence], num_input_tokens: list[int]
+    ) -> tuple[list[list[int]], list[torch.Tensor]]:
+        """Verify each previous target token plus its draft in one batch.
+
+        The first row is the uncomputed tail token already present in the
+        sequence; each following row checks one proposed token. Keeping all
+        rows in one paged-varlen target forward preserves target-only greedy
+        semantics while avoiding per-request verification launches.
+        """
+        if len(seqs) != len(num_input_tokens):
+            raise ValueError("EAGLE3 verification metadata does not match requests")
+        try:
+            for seq, num_tokens in zip(seqs, num_input_tokens):
+                seq.num_scheduled_tokens = num_tokens
+            input_ids, positions = self.prepare_prefill(seqs)
+            target_logits, aux_hidden_states = self.run_target_with_aux(
+                input_ids, positions, all_token_logits=True
+            )
+            offsets = [0]
+            for num_tokens in num_input_tokens:
+                offsets.append(offsets[-1] + num_tokens)
+            target_tokens = []
+            target_aux = []
+            for start, end in zip(offsets, offsets[1:]):
+                target_tokens.append(target_logits[start:end].argmax(dim=-1).tolist())
+                target_aux.append(aux_hidden_states[start:end])
+            return target_tokens, target_aux
+        finally:
+            for seq in seqs:
+                seq.num_scheduled_tokens = 0
+            reset_context()
+
+    @torch.inference_mode()
+    def _set_eagle3_decode_context(self, seqs: list[Sequence], step: int) -> None:
+        """Set paged-cache metadata for one EAGLE proposal step."""
+        block_tables = self.prepare_block_tables(seqs)
+        slot_mapping = []
+        context_lens = []
+        for seq in seqs:
+            # Query RoPE position is len(seq)-1+step, but the new K/V is
+            # appended after the existing len(seq) cached tokens.
+            position = len(seq) + step
+            block_index, block_offset = divmod(position, self.block_size)
+            slot_mapping.append(
+                seq.block_table[block_index] * self.block_size + block_offset
+            )
+            # Attention writes the current K/V before invoking the cache
+            # kernel, so the read length includes that newly written slot.
+            context_lens.append(len(seq) + step + 1)
+        slot_mapping = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        context_lens = torch.tensor(
+            context_lens, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
+
+    def _set_eagle3_commit_context(
+        self, seq: Sequence, slot_position: int, total_length: int
+    ) -> None:
+        """Set paged-cache metadata for one accepted EAGLE token."""
+        block_index, block_offset = divmod(slot_position, self.block_size)
+        set_context(
+            False,
+            slot_mapping=torch.tensor(
+                [seq.block_table[block_index] * self.block_size + block_offset],
+                dtype=torch.int32, device="cuda",
+            ),
+            context_lens=torch.tensor(
+                [total_length], dtype=torch.int32, device="cuda"
+            ),
+            block_tables=self.prepare_block_tables([seq]),
+        )
+
+    def _commit_eagle3_tokens(
+        self,
+        seq: Sequence,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        combined: torch.Tensor,
+        state: Eagle3KVCache,
+        start_position: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replay the accepted/replacement tail into the draft paged cache.
+
+        Rejected proposal pages may contain speculative K/V, so the draft
+        recurrent state must be rebuilt from the target-approved tail before
+        the next proposal can start from the same logical sequence.
+        """
+        hidden = feedback = None
+        prefix_length = start_position + 1
+        for index in range(input_ids.numel()):
+            self._set_eagle3_commit_context(
+                seq,
+                prefix_length + index,
+                prefix_length + index + 1,
+            )
+            hidden, feedback = self.eagle3_model.forward_with_cache(
+                input_ids[index:index + 1],
+                positions[index:index + 1],
+                combined[index:index + 1],
+            )
+        assert hidden is not None and feedback is not None
+        return hidden, feedback
+
+    @torch.inference_mode()
+    def propose_eagle3_batch(self, seqs: list[Sequence]) -> list[list[int]]:
+        """Generate greedy EAGLE proposals against the draft paged KV cache.
+
+        Proposals are batched to share draft launches. Their physical pages
+        were reserved by the scheduler before this method because each draft
+        step writes K/V before target verification accepts or rejects it.
+        """
+        assert self.eagle3_model is not None
+        assert self.speculative_config is not None
+        try:
+            limits = [
+                min(
+                    self.speculative_config.num_speculative_tokens,
+                    seq.max_tokens - seq.num_completion_tokens,
+                )
+                for seq in seqs
+            ]
+            proposals = [[] for _ in seqs]
+            hidden = torch.cat(
+                [self.eagle3_states[s.seq_id].last_hidden_state for s in seqs],
+                dim=0,
+            )
+            feedback = torch.cat(
+                [
+                    self.eagle3_states[s.seq_id].last_feedback_hidden_state
+                    for s in seqs
+                ],
+                dim=0,
+            )
+            next_token = self.eagle3_model.sample_greedy(hidden)
+            max_steps = max(limits, default=0)
+            for step in range(max_steps):
+                for row, token in enumerate(next_token.tolist()):
+                    if step < limits[row]:
+                        proposals[row].append(token)
+                if step + 1 == max_steps:
+                    break
+                positions = torch.tensor(
+                    [len(seq) - 1 + step for seq in seqs],
+                    dtype=torch.int64,
+                    device="cuda",
+                )
+                self._set_eagle3_decode_context(seqs, step)
+                hidden, feedback = self.eagle3_model.forward_with_cache(
+                    next_token, positions, feedback
+                )
+                next_token = self.eagle3_model.sample_greedy(hidden)
+            return proposals
+        finally:
+            reset_context()
+
+    @torch.inference_mode()
+    def commit_eagle3(
+        self,
+        seq: Sequence,
+        output_tokens: list[int],
+        target_aux_hidden_states: torch.Tensor,
+        start_position: int,
+    ) -> None:
+        if not output_tokens:
+            return
+        assert self.eagle3_model is not None
+        if seq.is_finished:
+            return
+        state = self.eagle3_states[seq.seq_id]
+        input_ids = torch.tensor(output_tokens, dtype=torch.int64, device="cuda")
+        positions = torch.arange(
+            start_position,
+            start_position + len(output_tokens),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        combined = self.eagle3_model.combine_hidden_states(
+            # Verification rows are [h(previous), h(accepted_1), ...].
+            # The output token at each position consumes the row immediately
+            # before it; this prefix therefore aligns replacement with its
+            # accepted predecessor rather than with the rejected draft.
+            target_aux_hidden_states[:len(output_tokens)]
+        )
+        draft_hidden_states, feedback_hidden_states = (
+            self._commit_eagle3_tokens(
+                seq, input_ids, positions, combined, state, start_position
+            )
+        )
+        state.last_hidden_state = draft_hidden_states[-1:]
+        state.last_feedback_hidden_state = feedback_hidden_states[-1:]
+
+    def release_eagle3_state(self, seq_id: int) -> None:
+        """Drop recurrent draft state when the scheduler finishes a request."""
+        self.eagle3_states.pop(seq_id, None)
 
     @torch.inference_mode()
     def run_pipeline_model(
@@ -412,7 +728,31 @@ class ModelRunner:
                 return self.run_pipeline_model(
                     input_ids, positions, temperatures, len(seqs)
                 )
-            logits = self.run_model(input_ids, positions, is_prefill)
+            if self.speculative_config is not None:
+                if not is_prefill:
+                    raise RuntimeError("EAGLE3 target runner received an unsupported decode")
+                context = get_context()
+                logits, aux_hidden_states = self.run_target_with_aux(
+                    input_ids, positions, all_token_logits=True
+                )
+                # The target prefill is flattened across requests. Initialize
+                # each request's independent EAGLE KV/state from its own
+                # contiguous rows, then sample only its final target row.
+                last_rows = context.cu_seqlens_q[1:] - 1
+                sampled_logits = logits[last_rows]
+                for index, seq in enumerate(seqs):
+                    start = int(context.cu_seqlens_q[index].item())
+                    end = int(context.cu_seqlens_q[index + 1].item())
+                    self.initialize_eagle3_state(
+                        seq,
+                        input_ids[start:end],
+                        positions[start:end],
+                        aux_hidden_states[start:end],
+                        sampled_logits[index].argmax().view(1),
+                    )
+                logits = sampled_logits
+            else:
+                logits = self.run_model(input_ids, positions, is_prefill)
             return (
                 self.sampler(logits, temperatures).tolist()
                 if should_sample

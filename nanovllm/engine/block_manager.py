@@ -142,3 +142,28 @@ class BlockManager:
                 self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def ensure_num_blocks_for_length(self, seq: Sequence, num_tokens: int) -> None:
+        """Reserve blocks before speculative decode writes uncommitted draft KV.
+
+        EAGLE writes its proposal into its paged KV cache before target
+        verification decides which tokens survive, so every possible proposal
+        position needs a physical block up front. ``truncate`` returns any
+        unused tail blocks after verification.
+        """
+        required_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) < required_blocks:
+            if not self.free_block_ids:
+                raise RuntimeError("not enough KV-cache blocks for speculative proposal")
+            block = self._allocate_block(self.free_block_ids[0])
+            seq.block_table.append(block.block_id)
+
+    def truncate(self, seq: Sequence) -> None:
+        """Release tail blocks after rejecting speculative proposal tokens."""
+        required_blocks = seq.num_blocks
+        for block_id in reversed(seq.block_table[required_blocks:]):
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        del seq.block_table[required_blocks:]

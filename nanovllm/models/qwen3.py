@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
 
@@ -24,6 +25,8 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        qkv_input_size: int | None = None,
+        use_qk_norm: bool | None = None,
     ) -> None:
         super().__init__()
         tp_size = get_tp_world_size()
@@ -38,9 +41,10 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
+        self.use_qk_norm = not qkv_bias if use_qk_norm is None else use_qk_norm
 
         self.qkv_proj = QKVParallelLinear(
-            hidden_size,
+            qkv_input_size or hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
@@ -63,24 +67,33 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        if not self.qkv_bias:
+        if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+    def project_qkv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project and rotate QKV for Qwen3-compatible attention variants."""
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k, v = self.project_qkv(positions, hidden_states)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
@@ -213,6 +226,26 @@ class Qwen3Model(nn.Module):
         hidden_states, _ = self.forward_stage(input_ids, positions)
         return hidden_states
 
+    def forward_with_aux_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        aux_hidden_state_layers: tuple[int, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not (self.is_first_stage and self.is_last_stage):
+            raise ValueError("EAGLE3 auxiliary hidden states require PP=1")
+        hidden_states = self.embed_tokens(input_ids)
+        residual = None
+        aux_hidden_states = []
+        for layer_id, layer in enumerate(self.layers.values(), start=1):
+            hidden_states, residual = layer(positions, hidden_states, residual)
+            if layer_id in aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
+        if len(aux_hidden_states) != len(aux_hidden_state_layers):
+            raise ValueError("requested EAGLE3 auxiliary layer is unavailable")
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states, torch.cat(aux_hidden_states, dim=-1)
+
 
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
@@ -266,9 +299,30 @@ class Qwen3ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions)
 
+    def forward_with_aux_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        aux_hidden_state_layers: tuple[int, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.model.forward_with_aux_hidden_states(
+            input_ids, positions, aux_hidden_state_layers
+        )
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         assert self.lm_head is not None
         return self.lm_head(hidden_states)
+
+    def compute_all_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return logits for every token during speculative verification.
+
+        ParallelLMHead intentionally keeps only the final prefill token for the
+        normal scheduler path. EAGLE3 verification needs one target logit per
+        proposed token and is limited to TP=1 by SpeculativeConfig.
+        """
+        assert self.lm_head is not None
+        assert get_tp_world_size() == 1
+        return F.linear(hidden_states, self.lm_head.weight)

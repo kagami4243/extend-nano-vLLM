@@ -12,6 +12,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.speculative import verify_greedy_proposals
 
 
 class LLMEngine:
@@ -74,6 +75,9 @@ class LLMEngine:
         return self.scheduler.block_manager.stats.copy()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        if self.config.speculative_config is not None:
+            if sampling_params.temperature != 0:
+                raise ValueError("EAGLE3 speculative decoding currently requires temperature=0")
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         if not prompt:
@@ -90,10 +94,68 @@ class LLMEngine:
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         scheduled_token_count = sum(seq.num_scheduled_tokens for seq in seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if self.config.speculative_config is not None and not is_prefill:
+            # EAGLE's draft forward writes proposal KV before target
+            # verification, so reserve the full proposal range first.
+            for seq in seqs:
+                self.scheduler.reserve_speculation(seq)
+            proposals = self.model_runner.call("propose_eagle3_batch", seqs)
+            base_num_tokens = []
+            for seq, proposal_tokens in zip(seqs, proposals):
+                base = self.scheduler.begin_speculation(seq, proposal_tokens)
+                base_num_tokens.append(base)
+                # The current sequence tail is the previous target output. It
+                # has not entered the target KV cache yet, so verify it with
+                # the drafts.
+                seq.num_computed_tokens = base - 1
+
+            target_tokens, target_aux_hidden_states = self.model_runner.call(
+                "verify_eagle3_batch",
+                seqs,
+                [len(proposal_tokens) + 1 for proposal_tokens in proposals],
+            )
+            for seq, proposal_tokens, base, tokens, aux in zip(
+                seqs, proposals, base_num_tokens, target_tokens,
+                target_aux_hidden_states,
+            ):
+                if len(tokens) != len(proposal_tokens) + 1:
+                    raise RuntimeError(
+                        "EAGLE3 target verification returned an incomplete batch: "
+                        f"proposals={len(proposal_tokens)}, "
+                        f"target_tokens={len(tokens)}"
+                    )
+                verification = verify_greedy_proposals(
+                    proposal_tokens, tokens
+                )
+                self.scheduler.postprocess_speculation(
+                    seq,
+                    base,
+                    verification.accepted_tokens,
+                    verification.replacement_token,
+                )
+                committed_tail = seq.token_ids[base:]
+                if committed_tail and not seq.is_finished:
+                    self.model_runner.call(
+                        "commit_eagle3",
+                        seq,
+                        committed_tail,
+                        aux[:len(committed_tail)],
+                        base - 1,
+                    )
+                if seq.is_finished:
+                    self.model_runner.call("release_eagle3_state", seq.seq_id)
+            token_ids = []
+            scheduled_token_count = sum(
+                len(seq) - base for seq, base in zip(seqs, base_num_tokens)
+            )
+        else:
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = scheduled_token_count if is_prefill else -len(seqs)
+        if self.config.speculative_config is not None and not is_prefill:
+            num_tokens = -scheduled_token_count
+        else:
+            num_tokens = scheduled_token_count if is_prefill else -len(seqs)
         return outputs, num_tokens
 
     def is_finished(self):

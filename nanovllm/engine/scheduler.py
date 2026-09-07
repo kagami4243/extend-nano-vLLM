@@ -10,6 +10,11 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.num_speculative_tokens = (
+            config.speculative_config.num_speculative_tokens
+            if config.speculative_config is not None
+            else 0
+        )
         self.eos = config.eos
         self.block_manager = BlockManager(
             config.num_kvcache_blocks,
@@ -106,3 +111,67 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def begin_speculation(self, seq: Sequence, proposal_tokens: list[int]) -> int:
+        if seq not in self.running:
+            raise RuntimeError("speculative decode requires a running sequence")
+        base_num_tokens = len(seq)
+        # ``reserve_speculation`` has already allocated every possible draft
+        # position before EAGLE writes proposal KV values.
+        seq.append_tokens(proposal_tokens)
+        return base_num_tokens
+
+    def reserve_speculation(self, seq: Sequence) -> None:
+        """Reserve physical blocks before EAGLE writes proposal KV values.
+
+        Target rejection only rolls back logical sequence tokens. The draft
+        attention kernel has already scattered K/V to physical slots, so the
+        slots must exist before proposal and are reclaimed by
+        ``postprocess_speculation`` after the accepted prefix is known.
+        """
+        max_tokens = min(
+            seq.max_tokens + seq.num_prompt_tokens,
+            len(seq) + self.num_speculative_tokens,
+        )
+        self.block_manager.ensure_num_blocks_for_length(seq, max_tokens)
+
+    def postprocess_speculation(
+        self,
+        seq: Sequence,
+        base_num_tokens: int,
+        accepted_tokens: list[int],
+        replacement_token: int | None,
+    ) -> int:
+        remaining = seq.max_tokens - (base_num_tokens - seq.num_prompt_tokens)
+        committed_tokens = accepted_tokens[:max(remaining, 0)]
+        reached_eos = not seq.ignore_eos and self.eos in committed_tokens
+        if reached_eos:
+            committed_tokens = committed_tokens[:committed_tokens.index(self.eos) + 1]
+            replacement_token = None
+        elif len(committed_tokens) < len(accepted_tokens):
+            replacement_token = None
+
+        seq.truncate_tokens(base_num_tokens + len(committed_tokens))
+        self.block_manager.truncate(seq)
+        # The target has evaluated the current tail and accepted drafts. A
+        # replacement/bonus token is an output and remains uncomputed.
+        seq.num_computed_tokens = base_num_tokens + len(committed_tokens)
+
+        if replacement_token is not None and seq.num_completion_tokens < seq.max_tokens:
+            # Finalize the full preceding block before placing the replacement
+            # token at the first position of the next block.
+            if len(seq) % self.block_manager.block_size == 0:
+                self.block_manager.may_append(seq)
+            seq.append_token(replacement_token)
+        elif len(seq) % self.block_manager.block_size == 0:
+            # No replacement was appended, so finalize the block immediately.
+            self.block_manager.may_append(seq)
+
+        if (
+            (not seq.ignore_eos and seq.last_token == self.eos)
+            or seq.num_completion_tokens >= seq.max_tokens
+        ):
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)
+        return len(committed_tokens)

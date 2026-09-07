@@ -3,7 +3,11 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn import (
+    flash_attn_func,
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
 from nanovllm.utils.context import get_context
 
 
@@ -59,15 +63,31 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        # Standalone model forwards (before the runner binds a cache) still
+        # need ordinary causal attention, e.g. checkpoint validation.
+        if not k_cache.numel() or not v_cache.numel():
+            return flash_attn_func(
+                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+                softmax_scale=self.scale, causal=True,
+            ).squeeze(0)
+        if context.slot_mapping is None or context.block_tables is None:
+            raise RuntimeError(
+                "paged KV attention requires slot mapping and block tables"
+            )
+        # Serving forwards always write through the logical-to-physical mapping
+        # before FlashAttention reads the layer-local paged cache.
+        store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            o = flash_attn_varlen_func(
+                q, k_cache, v_cache,
+                max_seqlen_q=context.max_seqlen_q,
+                cu_seqlens_q=context.cu_seqlens_q,
+                max_seqlen_k=context.max_seqlen_k,
+                cu_seqlens_k=context.cu_seqlens_k,
+                softmax_scale=self.scale,
+                causal=True,
+                block_table=context.block_tables,
+            )
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 

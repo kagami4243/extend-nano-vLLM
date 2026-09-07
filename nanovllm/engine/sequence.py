@@ -77,6 +77,19 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def append_tokens(self, token_ids: list[int]) -> None:
+        for token_id in token_ids:
+            self.append_token(token_id)
+
+    def truncate_tokens(self, num_tokens: int) -> None:
+        if not self.num_prompt_tokens <= num_tokens <= self.num_tokens:
+            raise ValueError("cannot truncate outside the sequence token range")
+        del self.token_ids[num_tokens:]
+        self.num_tokens = num_tokens
+        self.last_token = self.token_ids[-1]
+        self.num_computed_tokens = min(self.num_computed_tokens, num_tokens)
+        self.num_scheduled_tokens = min(self.num_scheduled_tokens, num_tokens)
+
     def __getstate__(self):
         return (
             self.num_tokens,
