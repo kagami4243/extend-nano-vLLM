@@ -43,9 +43,27 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Quantization
+
+Dense Qwen3 supports two minimal, online teaching modes:
+
+```python
+llm = LLM(model_path, quantization="w4a16")  # INT4 weight, BF16/FP16 GEMM
+llm = LLM(model_path, quantization="fp8")    # FP8 weight + activation GEMM
+```
+
+See [docs/quantization.md](docs/quantization.md) for concepts, implementation,
+tests, hardware requirements, and limitations.
+
 ## Benchmark
 
-See `bench.py` for benchmark.
+See `benchmarks/bench.py` for the general benchmark and
+`benchmarks/bench_spec_decode_eagle3.py` for the EAGLE3 benchmark.
+Run benchmark modules from the repository root, for example:
+
+```bash
+python -m benchmarks.bench_quantization none --model /data0/fwy/Codes/model/Qwen3-0.6B
+```
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)

@@ -8,6 +8,7 @@ from nanovllm.distributed.parallel_state import (
     get_tp_rank,
     get_tp_world_size,
 )
+from nanovllm.layers.quantization import apply_quantized_linear
 
 
 def divide(numerator, denominator):
@@ -28,6 +29,9 @@ class LinearBase(nn.Module):
         self.tp_dim = tp_dim
         self.tp_rank = get_tp_rank()
         self.tp_size = get_tp_world_size()
+        # Populated once by quantize_model after checkpoint loading. Keeping
+        # construction/loading unquantized preserves the existing TP loaders.
+        self.quantization: str | None = None
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -38,6 +42,13 @@ class LinearBase(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+    def apply_linear(
+        self, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.quantization is not None:
+            return apply_quantized_linear(x, self, bias)
+        return F.linear(x, self.weight, bias)
 
 
 class ReplicatedLinear(LinearBase):
@@ -54,7 +65,7 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self.apply_linear(x, self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -76,7 +87,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self.apply_linear(x, self.bias)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -153,7 +164,7 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        y = self.apply_linear(x, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y, group=get_tp_group())
         return y

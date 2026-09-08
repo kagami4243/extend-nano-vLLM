@@ -23,6 +23,7 @@ from nanovllm.distributed.parallel_state import (
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.quantization import quantize_model
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.models.eagle3 import Eagle3KVCache, load_eagle3_model
@@ -73,6 +74,10 @@ class ModelRunner:
             ep_size=self.ep_size,
         )
         load_model(self.model, config.model)
+        # Keep checkpoint loading and TP shard assembly unchanged, then replace
+        # only dense LinearBase weights with the selected teaching format.
+        # This mirrors vLLM's process_weights_after_loading phase.
+        quantize_model(self.model, config.quantization)
         self.speculative_config = config.speculative_config
         self.eagle3_model = None
         # EAGLE stores only its recurrent hidden state here. Its physical KV

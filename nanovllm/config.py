@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from nanovllm.layers.quantization import normalize_quantization
+
 
 @dataclass
 class SpeculativeConfig:
@@ -46,6 +48,7 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     speculative_config: SpeculativeConfig | dict | None = None
+    quantization: str | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -64,6 +67,7 @@ class Config:
             )
         assert self.device_offset >= 0
         assert self.max_num_batched_tokens > 0
+        self.quantization = normalize_quantization(self.quantization)
         if isinstance(self.speculative_config, dict):
             self.speculative_config = SpeculativeConfig(**self.speculative_config)
         if self.speculative_config is not None:
@@ -79,6 +83,10 @@ class Config:
                 )
             self.enable_prefix_caching = False
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.quantization is not None and self.hf_config.model_type != "qwen3":
+            raise ValueError(
+                "the teaching quantization implementation supports dense Qwen3 only"
+            )
         if self.hf_config.model_type == "qwen3_moe":
             assert self.enforce_eager, (
                 "the teaching Qwen3-MoE implementation requires eager mode"
