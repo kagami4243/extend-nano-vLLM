@@ -47,6 +47,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # ``fp8`` means float8_e4m3fn storage.  This teaching implementation uses
+    # one static K and V scale per attention layer, matching vLLM's fallback
+    # when a checkpoint does not provide calibrated KV scales.
+    kv_cache_dtype: str = "auto"
     speculative_config: SpeculativeConfig | dict | None = None
     quantization: str | None = None
 
@@ -57,6 +61,13 @@ class Config:
         assert 0 <= self.data_parallel_rank < self.data_parallel_size
         assert 1 <= self.tensor_parallel_size <= 8
         assert 1 <= self.pipeline_parallel_size <= 8
+        if self.kv_cache_dtype not in ("auto", "fp8"):
+            raise ValueError("kv_cache_dtype must be 'auto' or 'fp8'")
+        if self.kv_cache_dtype == "fp8":
+            # The current CUDA graph capture context intentionally contains no
+            # prefill metadata.  FP8 needs a distinct paged-attention kernel,
+            # so keep this first teaching implementation eager and correct.
+            self.enforce_eager = True
         if self.pipeline_parallel_size > 1:
             assert self.enforce_eager, (
                 "the teaching PP implementation currently requires eager mode"
@@ -82,6 +93,11 @@ class Config:
                     "EAGLE3 speculative decoding currently requires DP=TP=PP=1"
                 )
             self.enable_prefix_caching = False
+            if self.kv_cache_dtype == "fp8":
+                raise ValueError(
+                    "FP8 KV cache and EAGLE3 are not combined in the teaching "
+                    "implementation"
+                )
         self.hf_config = AutoConfig.from_pretrained(self.model)
         if self.quantization is not None and self.hf_config.model_type != "qwen3":
             raise ValueError(

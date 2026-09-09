@@ -17,6 +17,11 @@
   - vLLM-style Triton grouped GEMM 的最小实现
   - EP 语义、验证方式与当前限制
 
+#### 0️⃣.2 FP8 KV cache
+- **[fp8_kv_cache.md](fp8_kv_cache.md)**
+  - 单卡 FP8 page 存储与 Triton paged decode attention
+  - vLLM 参考实现、显存收益与硬件限制
+
 #### 1️⃣ 序列管理模块
 - **[engine_sequence.md](engine_sequence.md)**
   - `Sequence` 类定义

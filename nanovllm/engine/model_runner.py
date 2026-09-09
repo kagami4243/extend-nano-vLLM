@@ -188,6 +188,11 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
+        kv_cache_torch_dtype = (
+            torch.float8_e4m3fn
+            if config.kv_cache_dtype == "fp8"
+            else hf_config.torch_dtype
+        )
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -205,7 +210,7 @@ class ModelRunner:
             * self.block_size
             * num_kv_heads
             * head_dim
-            * hf_config.torch_dtype.itemsize
+            * kv_cache_torch_dtype.itemsize
         )
         local_num_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
@@ -223,6 +228,7 @@ class ModelRunner:
             self.block_size,
             num_kv_heads,
             head_dim,
+            dtype=kv_cache_torch_dtype,
         )
         layer_id = 0
         for module in self.model.modules():
@@ -292,6 +298,9 @@ class ModelRunner:
                 for parameter in self.model.parameters()
             ),
             "kv_cache_layers": self.kv_cache.size(1),
+            "kv_cache_dtype": str(self.kv_cache.dtype),
+            "kv_cache_blocks": self.kv_cache.size(2),
+            "kv_cache_bytes": self.kv_cache.numel() * self.kv_cache.element_size(),
             "pipeline_send_count": self.pipeline_send_count,
             "pipeline_recv_count": self.pipeline_recv_count,
         }

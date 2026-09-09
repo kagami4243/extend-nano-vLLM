@@ -41,7 +41,8 @@
       1024-token prefix 命中复用 1024 tokens；8192 prompt 的 8×1024 chunk 与单次
       prefill 输出一致。
 - [ ] 多请求 prefill batching，以及 decode 与长 prefill 的公平并行推进。
-- [ ] 使用fused-moe kernel进行加速
+- [x] 单卡最小 FP8 E4M3 KV cache：Triton page store、paged decode attention，以及
+      FA2 prefill 的临时 dequant fallback；当前仅 eager、Qwen head_dim=128、每层 scale=1。
 
 ### P3. PP 与 DP
 
@@ -98,7 +99,7 @@
 - [x] dense Qwen3 最小 W4A16：group-wise INT4 packed weight + Triton A16 GEMM。
 - [x] dense Qwen3 最小 FP8：per-tensor weight、动态 activation 和 scaled GEMM。
 - [x] Qwen3-0.6B eager/CUDA Graph 与 Qwen3-8B + EAGLE3 smoke test。
-- [ ] 预量化 GPTQ/AWQ/FP8 checkpoint、校准方法、MoE 和生产级 kernel。
+- [ ] 预量化 GPTQ/AWQ/FP8 checkpoint、KV scale 校准/加载、量化 MoE 和生产级 kernel。
 
 ## 当前主要限制
 
