@@ -8,10 +8,10 @@ tokens, response 256 tokens, `k=8`, greedy sampling, `temperature=0`,
 `ignore_eos=True`, `enforce_eager=True`, and prefix caching disabled.
 
 The three requested combinations were measured in separate processes. The
-"old EAGLE" implementation is a temporary compatibility model in
-`/data0/fwy/tmp/ablate_eagle_verify.py`: separate Q/K/V projections, separate
-gate/up projections, standalone RMSNorm, and the original single-request draft
-cache path. The checkpoint and target model are otherwise unchanged.
+"old EAGLE" implementation was a temporary, untracked compatibility model:
+separate Q/K/V projections, separate gate/up projections, standalone RMSNorm,
+and the original single-request draft-cache path. The checkpoint and target
+model were otherwise unchanged.
 
 | Draft model | Target verify | Drafted | Accepted | Acceptance rate | Mean acceptance length |
 | --- | --- | ---: | ---: | ---: | ---: |

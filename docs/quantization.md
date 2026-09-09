@@ -152,10 +152,10 @@ llm = LLM(
 
 ```bash
 conda run -n nanovllm python -m tests.test_quantization all
-conda run -n nanovllm python -m tests.test_quantized_qwen3 w4a16 --cuda-graph
-conda run -n nanovllm python -m tests.test_quantized_qwen3 fp8 --cuda-graph
-conda run -n nanovllm python -m tests.test_quantized_qwen3 w4a16 --speculative
-conda run -n nanovllm python -m tests.test_quantized_qwen3 fp8 --speculative
+conda run -n nanovllm python -m tests.test_quantized_qwen3 w4a16 --model /path/to/Qwen3-0.6B --cuda-graph
+conda run -n nanovllm python -m tests.test_quantized_qwen3 fp8 --model /path/to/Qwen3-0.6B --cuda-graph
+conda run -n nanovllm python -m tests.test_quantized_qwen3 w4a16 --speculative --target-model /path/to/Qwen3-8B --draft-model /path/to/Qwen3-8B-eagle3
+conda run -n nanovllm python -m tests.test_quantized_qwen3 fp8 --speculative --target-model /path/to/Qwen3-8B --draft-model /path/to/Qwen3-8B-eagle3
 ```
 
 ## 9. 实际推理性能
@@ -168,9 +168,9 @@ admit 一个 prefill sequence，因此表中的 prefill 是 16 个真实单序�
 命令：
 
 ```bash
-conda run -n nanovllm python -m benchmarks.bench_quantization none --model /data0/fwy/Codes/model/Qwen3-0.6B
-conda run -n nanovllm python -m benchmarks.bench_quantization w4a16 --model /data1/model/qwen/Qwen/Qwen3-8B
-conda run -n nanovllm python -m benchmarks.bench_quantization fp8 --model /data1/model/qwen/Qwen/Qwen3-8B
+conda run -n nanovllm python -m benchmarks.bench_quantization none --model /path/to/Qwen3-0.6B
+conda run -n nanovllm python -m benchmarks.bench_quantization w4a16 --model /path/to/Qwen3-8B
+conda run -n nanovllm python -m benchmarks.bench_quantization fp8 --model /path/to/Qwen3-8B
 ```
 
 `batch=16`、每请求 `prompt=512`、测量 `decode=64` 的实际生成结果：

@@ -7,22 +7,24 @@ from nanovllm import LLM, SamplingParams
 from nanovllm.layers.linear import LinearBase
 
 
-MODEL = "/data0/fwy/Codes/model/Qwen3-0.6B"
-SPECULATIVE_TARGET = "/data1/model/qwen/Qwen/Qwen3-8B"
-EAGLE3_MODEL = "/data0/fwy/Codes/model/Qwen3-8B-speculator.eagle3"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("quantization", choices=("none", "w4a16", "fp8"))
-    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--model", help="Local model directory for non-speculative tests")
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--speculative", action="store_true")
+    parser.add_argument("--target-model", help="Target model directory for EAGLE3")
+    parser.add_argument("--draft-model", help="EAGLE3 draft model directory")
     args = parser.parse_args()
+    if args.speculative:
+        if not args.target_model or not args.draft_model:
+            parser.error("--speculative requires --target-model and --draft-model")
+    elif not args.model:
+        parser.error("--model is required without --speculative")
 
     quantization = None if args.quantization == "none" else args.quantization
     llm = LLM(
-        SPECULATIVE_TARGET if args.speculative else args.model,
+        args.target_model if args.speculative else args.model,
         quantization=quantization,
         enforce_eager=not args.cuda_graph,
         max_model_len=128,
@@ -32,7 +34,7 @@ def main() -> None:
         speculative_config=(
             {
                 "method": "eagle3",
-                "model": EAGLE3_MODEL,
+                "model": args.draft_model,
                 "num_speculative_tokens": 3,
             }
             if args.speculative

@@ -5,7 +5,7 @@ BF16/FP16。每个 KV 元素由 1 byte 取代 BF16 的 2 bytes，因此相同显
 可容纳约两倍 token；模型权重、activation 和临时 prefill buffer 不变。
 
 ```python
-llm = LLM("/data0/fwy/Codes/model/Qwen3-0.6B", kv_cache_dtype="fp8")
+llm = LLM("/path/to/Qwen3-0.6B", kv_cache_dtype="fp8")
 ```
 
 ## 实现与 vLLM 对照

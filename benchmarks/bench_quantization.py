@@ -17,10 +17,6 @@ import torch
 from nanovllm import LLM, SamplingParams
 
 
-QWEN3_06B = "/data0/fwy/Codes/model/Qwen3-0.6B"
-QWEN3_8B = "/data1/model/qwen/Qwen/Qwen3-8B"
-
-
 def measure(callable_):
     torch.cuda.synchronize()
     start = perf_counter()
@@ -32,7 +28,7 @@ def measure(callable_):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("quantization", choices=("none", "w4a16", "fp8"))
-    parser.add_argument("--model", default=QWEN3_06B)
+    parser.add_argument("--model", required=True, help="Local Hugging Face model directory")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--decode-tokens", type=int, default=64)

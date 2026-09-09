@@ -1,7 +1,8 @@
-# Nano-vLLM 当前 TODO
+# nano-vLLM roadmap
 
-状态以当前代码和已有测试覆盖为准；2026-08-18 已使用 Qwen3-0.6B
-在 GPU 1、2、3、4 上完成长上下文和组合并行实测。
+This is a learning roadmap, not a production-support matrix. Status reflects
+the checked-in implementation and reproducible tests; hardware-specific
+measurements are recorded in the relevant documents under `docs/`.
 
 - `[x]` 已实现，且有对应代码或测试覆盖。
 - `[~]` 已有教学版/部分覆盖，但未达到原始目标的完整范围。
@@ -112,6 +113,8 @@
       `enforce_eager=True`。
 - [ ] 理解torch.compile与cuda.graph的作用
 
-## 最终目标
-- [ ] 在H200x4上接入一个Qwen3-Next-80B-A3B-Instruct model，并达到与vllm相当的TTFT和TPOT性能。
-- [ ] 在H200x4上接入一个deepseek-v4-flash-{quant} model，并达到与vllm相当的TTFT和TPOT性能。
+## Long-term directions
+
+- [ ] Validate the teaching abstractions on a larger Qwen MoE checkpoint.
+- [ ] Improve observability and compare individual kernels with production
+      engines; performance parity is explicitly out of scope.

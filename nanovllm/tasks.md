@@ -267,7 +267,7 @@ replica 均成功返回。跨 replica 的 prefix/KV cache 共享、负载均衡�
 **当前状态：已完成教学版 MoE 与 EP=1/2。** EP 没有独立 size：启用
 `enable_expert_parallel` 时复用 TP ranks，因此 Qwen3-MoE 的非 expert 部分仍按 TP
 切分，而每个 rank 持有完整的本地 expert 子集。使用
-`/data1/model/qwen/Qwen/Qwen3-30B-A3B-Base`：48 个 MoE 层、128 experts、
+一个 Qwen3-30B-A3B-Base checkpoint：48 个 MoE 层、128 experts、
 top-8。EP=2 时 GPU 2、3 各持有连续的 64 个 experts，attention、router、
 embedding 与 LM head 保持复制。
 

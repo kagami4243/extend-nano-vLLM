@@ -18,8 +18,6 @@ import torch
 from transformers import AutoTokenizer
 
 
-TARGET_MODEL = "/data1/model/qwen/Qwen/Qwen3-8B"
-EAGLE3_MODEL = "/data0/fwy/Codes/model/Qwen3-8B-speculator.eagle3"
 PROMPT_TOKENS = 1024
 OUTPUT_TOKENS = 256
 WARMUP_PROMPT_TOKENS = 16
@@ -34,8 +32,8 @@ class Latency:
     output_tokens: int
 
 
-def make_prompt_token_ids(num_tokens: int) -> list[int]:
-    tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL, use_fast=True)
+def make_prompt_token_ids(model: str, num_tokens: int) -> list[int]:
+    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
     token_ids = tokenizer.encode(" benchmark", add_special_tokens=False)
     if not token_ids:
         raise RuntimeError("failed to build the benchmark prompt token")
@@ -79,7 +77,7 @@ def measure_nanovllm_request(llm, prompt_token_ids: list[int], max_tokens: int) 
     )
 
 
-def run_nanovllm() -> dict[str, float | int]:
+def run_nanovllm(args) -> dict[str, float | int]:
     from nanovllm import LLM
     import nanovllm.engine.llm_engine as engine_module
 
@@ -95,7 +93,7 @@ def run_nanovllm() -> dict[str, float | int]:
     engine_module.verify_greedy_proposals = count_verify
 
     llm = LLM(
-        TARGET_MODEL,
+        args.target_model,
         enforce_eager=False,
         max_model_len=PROMPT_TOKENS + OUTPUT_TOKENS,
         max_num_batched_tokens=PROMPT_TOKENS + OUTPUT_TOKENS,
@@ -104,19 +102,23 @@ def run_nanovllm() -> dict[str, float | int]:
         enable_prefix_caching=False,
         speculative_config={
             "method": "eagle3",
-            "model": EAGLE3_MODEL,
+            "model": args.draft_model,
             "num_speculative_tokens": 8,
         },
     )
     try:
         measure_nanovllm_request(
-            llm, make_prompt_token_ids(WARMUP_PROMPT_TOKENS), WARMUP_OUTPUT_TOKENS
+            llm,
+            make_prompt_token_ids(args.target_model, WARMUP_PROMPT_TOKENS),
+            WARMUP_OUTPUT_TOKENS,
         )
         acceptance["drafted"] = 0
         acceptance["accepted"] = 0
         results = [
             measure_nanovllm_request(
-                llm, make_prompt_token_ids(PROMPT_TOKENS), OUTPUT_TOKENS
+                llm,
+                make_prompt_token_ids(args.target_model, PROMPT_TOKENS),
+                OUTPUT_TOKENS,
             )
             for _ in range(NUM_RUNS)
         ]
@@ -160,14 +162,14 @@ async def measure_vllm_request(engine, prompt_token_ids: list[int], max_tokens: 
     )
 
 
-async def run_vllm_async(profile_dir: str | None = None) -> dict[str, float | int]:
+async def run_vllm_async(args) -> dict[str, float | int]:
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.config import ProfilerConfig
 
     engine_args = AsyncEngineArgs(
-        model=TARGET_MODEL,
-        tokenizer=TARGET_MODEL,
+        model=args.target_model,
+        tokenizer=args.target_model,
         dtype="bfloat16",
         trust_remote_code=True,
         enforce_eager=False,
@@ -178,7 +180,7 @@ async def run_vllm_async(profile_dir: str | None = None) -> dict[str, float | in
         enable_prefix_caching=False,
         speculative_config={
             "method": "eagle3",
-            "model": EAGLE3_MODEL,
+            "model": args.draft_model,
             "num_speculative_tokens": 8,
             "max_model_len": PROMPT_TOKENS + OUTPUT_TOKENS,
         },
@@ -186,11 +188,11 @@ async def run_vllm_async(profile_dir: str | None = None) -> dict[str, float | in
             {
                 "profiler_config": ProfilerConfig(
                     profiler="torch",
-                    torch_profiler_dir=profile_dir,
+                    torch_profiler_dir=args.profile_dir,
                     torch_profiler_with_stack=False,
                 )
             }
-            if profile_dir
+            if args.profile_dir
             else {}
         ),
     )
@@ -198,19 +200,19 @@ async def run_vllm_async(profile_dir: str | None = None) -> dict[str, float | in
     try:
         await measure_vllm_request(
             engine,
-            make_prompt_token_ids(WARMUP_PROMPT_TOKENS),
+            make_prompt_token_ids(args.target_model, WARMUP_PROMPT_TOKENS),
             WARMUP_OUTPUT_TOKENS,
             "warmup",
         )
         await engine.do_log_stats()
-        if profile_dir:
+        if args.profile_dir:
             await engine.start_profile()
             try:
                 return summarize(
                     [
                         await measure_vllm_request(
                             engine,
-                            make_prompt_token_ids(PROMPT_TOKENS),
+                            make_prompt_token_ids(args.target_model, PROMPT_TOKENS),
                             OUTPUT_TOKENS,
                             "profile",
                         )
@@ -221,7 +223,7 @@ async def run_vllm_async(profile_dir: str | None = None) -> dict[str, float | in
         results = [
             await measure_vllm_request(
                 engine,
-                make_prompt_token_ids(PROMPT_TOKENS),
+                make_prompt_token_ids(args.target_model, PROMPT_TOKENS),
                 OUTPUT_TOKENS,
                 f"measure-{index}",
             )
@@ -238,14 +240,16 @@ async def run_vllm_async(profile_dir: str | None = None) -> dict[str, float | in
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("backend", choices=("vllm", "nanovllm"))
+    parser.add_argument("--target-model", required=True, help="Local target model directory")
+    parser.add_argument("--draft-model", required=True, help="Local EAGLE3 draft model directory")
     parser.add_argument("--profile-dir")
     args = parser.parse_args()
     if args.profile_dir and args.backend != "vllm":
         parser.error("--profile-dir is currently supported only for vllm")
     result = (
-        asyncio.run(run_vllm_async(args.profile_dir))
+        asyncio.run(run_vllm_async(args))
         if args.backend == "vllm"
-        else run_nanovllm()
+        else run_nanovllm(args)
     )
     print(json.dumps({"backend": args.backend, **result}, indent=2))
 
