@@ -63,7 +63,9 @@
       `all_reduce(SUM)` 合并局部输出。
 - [x] MoE router 数学、expert 权重分片和 EP=2 对比 EP=1 的测试代码。
 - [ ] 真实 token all-to-all dispatch/combine；当前所有 EP rank 复制 token 和 router。
-- [ ] fused/grouped expert GEMM；当前逐 expert Python loop 和多个 `F.linear`。
+- [x] BF16/FP16 Triton grouped expert GEMM；复用 vLLM 的 expert-major、block-aligned
+      布局，消除逐 expert Python loop 和多个 `F.linear`。排序/对齐仍是 GPU PyTorch 操作，
+      尚非生产级完整 fused MoE。
 - [ ] shared experts、expert capacity/token dropping、EPLB 或动态 expert placement。
 - [ ] EP=4 回归，以及 EP 与 TP/PP 的组合。
 
@@ -93,14 +95,18 @@
 
 ### P7. Quantization
 
-- [ ] 加入量化推理
+- [x] dense Qwen3 最小 W4A16：group-wise INT4 packed weight + Triton A16 GEMM。
+- [x] dense Qwen3 最小 FP8：per-tensor weight、动态 activation 和 scaled GEMM。
+- [x] Qwen3-0.6B eager/CUDA Graph 与 Qwen3-8B + EAGLE3 smoke test。
+- [ ] 预量化 GPTQ/AWQ/FP8 checkpoint、校准方法、MoE 和生产级 kernel。
 
 ## 当前主要限制
 
 - [~] `TP + PP` 和 `DP + TP` 已有教学版 2+2 实现并实测；`TP + EP`、`PP + EP` 等
       MoE 组合仍未完成。
 - [ ] PP 是同步单 microbatch 实现，不会填充推理流水线。
-- [ ] MoE EP 不是生产级 all-to-all 实现，也未使用 fused MoE kernel。fused MoE kernel应该支持triton和DeepGEMM两种常见kernel实现。
+- [~] MoE EP 不是生产级 all-to-all 实现；已使用 Triton grouped MoE kernel，但尚未支持
+      DeepGEMM、量化 MoE 或完整 fused MoE kernel。
 - [ ] CUDA Graph 仅覆盖单卡/TP 的固定 batch decode；PP 与 EP 强制
       `enforce_eager=True`。
 - [ ] 理解torch.compile与cuda.graph的作用

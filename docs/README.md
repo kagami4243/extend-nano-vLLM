@@ -7,6 +7,16 @@
 
 ### 各模块详细文档
 
+#### 0️⃣ 量化专题
+- **[quantization.md](quantization.md)**
+  - W4A16 weight-only 与 FP8 W8A8 的区别
+  - 量化布局、执行路径、测试和当前限制
+
+#### 0️⃣.1 MoE grouped kernel
+- **[moe_kernel.md](moe_kernel.md)**
+  - vLLM-style Triton grouped GEMM 的最小实现
+  - EP 语义、验证方式与当前限制
+
 #### 1️⃣ 序列管理模块
 - **[engine_sequence.md](engine_sequence.md)**
   - `Sequence` 类定义

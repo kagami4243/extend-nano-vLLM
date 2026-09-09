@@ -311,10 +311,16 @@ expert 权重加载单测，以及 GPU 1 上 EP=1、GPU 2/3 上 EP=2 的真实�
   完整 top-k assignment 数，且每个 rank 的 all-reduce 计数非零。
 - EP=2 greedy token IDs 必须与 EP=1 完全一致。
 
-**暂未完成：** 当前不是生产级 all-to-all token dispatch，没有融合/分组 GEMM，短
-batch 会产生较多小 GEMM；也不支持 EP 与 TP/PP 组合。后续路线是先用两次
-all-to-all 替换复制 token 路径，再增加 EP=4 和 Transformers 固定 logits/token
-reference。当前实现只能称为“专家权重切分 + 输出归并”的教学 EP。
+**已补充 grouped GEMM：** CUDA BF16/FP16 路径使用 vLLM-style Triton grouped GEMM：
+top-k assignment 按本地 expert 排序并补齐到 16 行，两次 kernel 分别计算 `gate_up` 与
+`down`，后者融合路由权重；保留 GPU 上的 SwiGLU 和一次 `index_add` combine。实现和
+验证见 `docs/moe_kernel.md`。为保持教学代码自包含，排序/对齐暂由 GPU PyTorch 操作完成，
+而非 vLLM 的 `moe_align_block_size` CUDA op。
+
+**暂未完成：** 当前不是生产级 all-to-all token dispatch，也不是单 kernel 的完整 fused
+MoE；短 batch 仍有排序/补齐开销，也不支持 DeepGEMM、量化 MoE 或 EP 与 TP/PP 组合。
+后续路线是先用两次 all-to-all 替换复制 token 路径，再增加 EP=4 和 Transformers 固定
+logits/token reference。当前实现仍应视为“专家权重切分 + 输出归并”的教学 EP。
 
 ## P5. Speculative Decoding
 
