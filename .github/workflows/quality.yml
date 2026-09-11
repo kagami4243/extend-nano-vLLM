@@ -22,6 +22,6 @@ jobs:
 
           project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
           assert project["readme"] == "README.md"
-          for document in ("LICENSE", "README.md", "CONTRIBUTING.md", "NOTICE"):
+          for document in ("LICENSE", "README.md", "CONTRIBUTING.md", "NOTICE", "CITATION.cff"):
               assert Path(document).is_file(), document
           PY

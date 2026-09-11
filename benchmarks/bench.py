@@ -1,12 +1,10 @@
 import argparse
 import time
 from random import randint, seed
-from nanovllm import LLM, SamplingParams
-# from vllm import LLM, SamplingParams
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Measure a synthetic nano-vLLM workload.")
+    parser = argparse.ArgumentParser(description="Measure a synthetic extend-nano-vLLM workload.")
     parser.add_argument("--model", required=True, help="Local Hugging Face model directory")
     parser.add_argument("--num-seqs", type=int, default=256)
     parser.add_argument("--max-input-len", type=int, default=1024)
@@ -14,6 +12,8 @@ def main():
     args = parser.parse_args()
     if min(args.num_seqs, args.max_input_len, args.max_output_len) < 1:
         parser.error("all workload dimensions must be positive")
+
+    from nanovllm import LLM, SamplingParams
 
     seed(0)
     llm = LLM(args.model, enforce_eager=False, max_model_len=4096)

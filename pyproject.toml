@@ -3,13 +3,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
-version = "0.2.0"
+name = "extend-nano-vllm"
+version = "0.3.0"
 authors = [{ name = "Xingkai Yu" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "A readable, vLLM-style inference engine for learning"
+description = "An extended nano-vLLM runtime for Qwen3 inference experiments"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
@@ -28,9 +28,9 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/GeeeekExplorer/nano-vllm"
-Repository = "https://github.com/GeeeekExplorer/nano-vllm"
-Issues = "https://github.com/GeeeekExplorer/nano-vllm/issues"
+Homepage = "https://github.com/GeeeekExplorer/extend-nano-vllm"
+Repository = "https://github.com/GeeeekExplorer/extend-nano-vllm"
+Issues = "https://github.com/GeeeekExplorer/extend-nano-vllm/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -40,8 +40,8 @@ include = ["nanovllm*"]
 addopts = "--strict-markers"
 markers = [
     "unit: CPU-only unit test",
-    "single_gpu: requires idle physical GPU 1",
-    "multi_gpu: requires idle physical GPUs 2 and 3",
+    "single_gpu: requires one CUDA-capable GPU",
+    "multi_gpu: requires multiple CUDA-capable GPUs",
     "slow: long-running integration test",
 ]
 timeout = 180

@@ -1,13 +1,14 @@
 import argparse
 
-from nanovllm import LLM, SamplingParams
-from transformers import AutoTokenizer
-
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate text with nano-vLLM.")
+    parser = argparse.ArgumentParser(description="Generate text with extend-nano-vLLM.")
     parser.add_argument("model", help="Local Hugging Face model directory")
     args = parser.parse_args()
+
+    from nanovllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1)
 

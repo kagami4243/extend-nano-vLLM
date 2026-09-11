@@ -1,8 +1,8 @@
-nano-vLLM contains small, adapted kernel structures from the vLLM project.
+extend-nano-vLLM contains small, adapted kernel structures from the vLLM project.
 
 vLLM is licensed under the Apache License, Version 2.0:
 https://github.com/vllm-project/vllm/blob/main/LICENSE
 
 The affected source files contain local attribution comments identifying the
-reference implementation. The remaining nano-vLLM code is licensed under the
+reference implementation. The remaining extend-nano-vLLM code is licensed under the
 MIT License; see LICENSE.

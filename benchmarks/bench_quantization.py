@@ -1,4 +1,4 @@
-"""Measure nano-vLLM BF16, W4A16, and FP8 inference under the same workload.
+"""Measure extend-nano-vLLM BF16, W4A16, and FP8 inference under one workload.
 
 Run as ``python -m benchmarks.bench_quantization ...`` from the repository
 root. Run one quantization mode per process so allocator state from an earlier
@@ -13,8 +13,6 @@ import json
 from time import perf_counter
 
 import torch
-
-from nanovllm import LLM, SamplingParams
 
 
 def measure(callable_):
@@ -35,6 +33,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.batch_size < 1 or args.prompt_tokens < 1 or args.decode_tokens < 1:
         parser.error("batch size, prompt tokens, and decode tokens must be positive")
+
+    from nanovllm import LLM, SamplingParams
 
     quantization = None if args.quantization == "none" else args.quantization
     max_model_len = args.prompt_tokens + args.batch_size + args.decode_tokens + 1
@@ -57,7 +57,7 @@ def main() -> None:
             [index % 10000 for index in range(args.prompt_tokens)]
             for _ in range(args.batch_size)
         ]
-        # nano-vLLM currently admits one prefill sequence at a time and
+        # The current scheduler admits one prefill sequence at a time and
         # interleaves decode steps while later prompts wait. Reserve enough
         # output tokens for that admission phase plus the measured decode.
         sampling = SamplingParams(

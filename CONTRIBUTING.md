@@ -1,12 +1,12 @@
-# Contributing to nano-vLLM
+# Contributing to extend-nano-vLLM
 
-Thanks for improving this learning project.
+Thanks for improving extend-nano-vLLM.
 
 ## Scope
 
-Prefer changes that make an inference-engine concept easier to inspect,
-measure, or validate. Keep a feature small and document its deliberate limits;
-this repository does not aim to duplicate all of vLLM.
+Prefer changes that improve inference behavior, validation, or reproducible
+measurement. Keep each feature focused and preserve a clear numerical or
+functional reference path when practical.
 
 ## Development guidelines
 

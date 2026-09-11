@@ -1,4 +1,4 @@
-"""Measure single-request EAGLE3 TTFT and TTPO for vLLM or nano-vLLM.
+"""Measure single-request EAGLE3 TTFT and TTPO for vLLM or extend-nano-vLLM.
 
 The two backends run as separate processes. Model construction and a short
 warm-up request are excluded from the measurement. TTPO is measured from the
@@ -68,7 +68,7 @@ def measure_nanovllm_request(llm, prompt_token_ids: list[int], max_tokens: int) 
             first_token_time = perf_counter()
     end = perf_counter()
     if first_token_time is None:
-        raise RuntimeError("nano-vLLM emitted no output token")
+        raise RuntimeError("extend-nano-vLLM emitted no output token")
     output_tokens = seq.num_completion_tokens
     return Latency(
         ttft_ms=(first_token_time - start) * 1000,

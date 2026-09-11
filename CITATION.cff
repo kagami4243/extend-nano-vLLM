@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use extend-nano-vLLM in your work, please cite this repository."
+title: "extend-nano-vLLM"
+version: 0.3.0
+type: software
+authors:
+  - family-names: Yu
+    given-names: Xingkai
+license: MIT
+repository-code: "https://github.com/GeeeekExplorer/extend-nano-vllm"
