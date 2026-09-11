@@ -1,5 +1,7 @@
 # extend-nano-vLLM
 
+English | [简体中文](README_CN.md)
+
 `extend-nano-vLLM` is an experimental GPU inference runtime built by extending
 [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm). It keeps the compact
 offline-generation API of the base project while adding model execution,
