@@ -128,11 +128,23 @@ class BlockManager:
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
+            # Speculative decoding may reserve the next page before the
+            # scheduler reaches the following decode step.  In that case the
+            # page table is already long enough and appending must be
+            # idempotent rather than allocating a duplicate page.
+            if len(block_table) >= seq.num_blocks:
+                return
             assert last_block.hash != -1
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
+            # EAGLE may have already committed and hashed this page while
+            # installing its replacement token.  The regular scheduler can
+            # therefore reach the same boundary again; finalization must be
+            # idempotent.
+            if last_block.hash != -1:
+                return
             assert last_block.hash == -1
             token_ids = seq.block(seq.num_blocks-1)
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1

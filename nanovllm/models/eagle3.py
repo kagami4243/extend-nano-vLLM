@@ -203,7 +203,13 @@ class Eagle3ForCausalLM(nn.Module):
         return False
 
     def validate_loaded_weights(self) -> None:
-        expected = set(self.state_dict())
+        # Runtime-only attention buffers (for example FP8 KV-cache scales) are
+        # registered in ``state_dict`` but are not part of an EAGLE3
+        # checkpoint.  Validate checkpoint parameters plus the two explicit
+        # vocabulary mapping buffers instead of treating every runtime buffer
+        # as a required weight.
+        expected = {name for name, _ in self.named_parameters()}
+        expected.update(("d2t", "t2d"))
         for packed_name, source_names in {
             "layers.0.self_attn.qkv_proj.weight": (
                 "layers.0.self_attn.q_proj.weight",

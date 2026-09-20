@@ -158,11 +158,13 @@ class Scheduler:
         seq.num_computed_tokens = base_num_tokens + len(committed_tokens)
 
         if replacement_token is not None and seq.num_completion_tokens < seq.max_tokens:
-            # Finalize the full preceding block before placing the replacement
-            # token at the first position of the next block.
+            # A replacement can cross a page boundary.  Finalize the old page
+            # before appending, then reserve the new page so EAGLE can replay
+            # the replacement KV without indexing past the block table.
             if len(seq) % self.block_manager.block_size == 0:
                 self.block_manager.may_append(seq)
             seq.append_token(replacement_token)
+            self.block_manager.may_append(seq)
         elif len(seq) % self.block_manager.block_size == 0:
             # No replacement was appended, so finalize the block immediately.
             self.block_manager.may_append(seq)

@@ -92,19 +92,20 @@ def run_nanovllm(args) -> dict[str, float | int]:
 
     engine_module.verify_greedy_proposals = count_verify
 
+    speculative_config = None if args.disable_eagle else {
+        "method": "eagle3",
+        "model": args.draft_model,
+        "num_speculative_tokens": 8,
+    }
     llm = LLM(
         args.target_model,
         enforce_eager=False,
-        max_model_len=PROMPT_TOKENS + OUTPUT_TOKENS,
-        max_num_batched_tokens=PROMPT_TOKENS + OUTPUT_TOKENS,
+        max_model_len=args.prompt_tokens + args.output_tokens,
+        max_num_batched_tokens=args.prompt_tokens + args.output_tokens,
         max_num_seqs=1,
         gpu_memory_utilization=0.8,
         enable_prefix_caching=False,
-        speculative_config={
-            "method": "eagle3",
-            "model": args.draft_model,
-            "num_speculative_tokens": 8,
-        },
+        speculative_config=speculative_config,
     )
     try:
         measure_nanovllm_request(
@@ -117,15 +118,21 @@ def run_nanovllm(args) -> dict[str, float | int]:
         results = [
             measure_nanovllm_request(
                 llm,
-                make_prompt_token_ids(args.target_model, PROMPT_TOKENS),
-                OUTPUT_TOKENS,
+                make_prompt_token_ids(args.target_model, args.prompt_tokens),
+                args.output_tokens,
             )
-            for _ in range(NUM_RUNS)
+            for _ in range(args.num_runs)
         ]
         result = summarize(results)
-        result.update(acceptance_rate=(100 * acceptance["accepted"] / acceptance["drafted"]
-                                       if acceptance["drafted"] else float("nan")),
-                      drafted=acceptance["drafted"], accepted=acceptance["accepted"])
+        if not args.disable_eagle:
+            result.update(
+                acceptance_rate=(
+                    100 * acceptance["accepted"] / acceptance["drafted"]
+                    if acceptance["drafted"] else float("nan")
+                ),
+                drafted=acceptance["drafted"],
+                accepted=acceptance["accepted"],
+            )
         return result
     finally:
         engine_module.verify_greedy_proposals = original_verify
@@ -167,23 +174,24 @@ async def run_vllm_async(args) -> dict[str, float | int]:
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.config import ProfilerConfig
 
+    speculative_config = None if args.disable_eagle else {
+        "method": "eagle3",
+        "model": args.draft_model,
+        "num_speculative_tokens": 8,
+        "max_model_len": args.prompt_tokens + args.output_tokens,
+    }
     engine_args = AsyncEngineArgs(
         model=args.target_model,
         tokenizer=args.target_model,
         dtype="bfloat16",
         trust_remote_code=True,
         enforce_eager=False,
-        max_model_len=PROMPT_TOKENS + OUTPUT_TOKENS,
-        max_num_batched_tokens=PROMPT_TOKENS + OUTPUT_TOKENS,
+        max_model_len=args.prompt_tokens + args.output_tokens,
+        max_num_batched_tokens=args.prompt_tokens + args.output_tokens,
         max_num_seqs=1,
         gpu_memory_utilization=0.8,
         enable_prefix_caching=False,
-        speculative_config={
-            "method": "eagle3",
-            "model": args.draft_model,
-            "num_speculative_tokens": 8,
-            "max_model_len": PROMPT_TOKENS + OUTPUT_TOKENS,
-        },
+        speculative_config=speculative_config,
         **(
             {
                 "profiler_config": ProfilerConfig(
@@ -212,8 +220,8 @@ async def run_vllm_async(args) -> dict[str, float | int]:
                     [
                         await measure_vllm_request(
                             engine,
-                            make_prompt_token_ids(args.target_model, PROMPT_TOKENS),
-                            OUTPUT_TOKENS,
+                            make_prompt_token_ids(args.target_model, args.prompt_tokens),
+                            args.output_tokens,
                             "profile",
                         )
                     ]
@@ -223,11 +231,11 @@ async def run_vllm_async(args) -> dict[str, float | int]:
         results = [
             await measure_vllm_request(
                 engine,
-                make_prompt_token_ids(args.target_model, PROMPT_TOKENS),
-                OUTPUT_TOKENS,
+                make_prompt_token_ids(args.target_model, args.prompt_tokens),
+                args.output_tokens,
                 f"measure-{index}",
             )
-            for index in range(NUM_RUNS)
+            for index in range(args.num_runs)
         ]
         # Flush vLLM's interval logger so speculative draft/accept counts are
         # emitted for this short offline benchmark.
@@ -243,7 +251,21 @@ def main() -> None:
     parser.add_argument("--target-model", required=True, help="Local target model directory")
     parser.add_argument("--draft-model", required=True, help="Local EAGLE3 draft model directory")
     parser.add_argument("--profile-dir")
+    parser.add_argument("--prompt-tokens", type=int, default=PROMPT_TOKENS)
+    parser.add_argument("--output-tokens", type=int, default=OUTPUT_TOKENS)
+    parser.add_argument("--num-runs", type=int, default=NUM_RUNS)
+    parser.add_argument(
+        "--result-file",
+        help="optional path where the final JSON result is written",
+    )
+    parser.add_argument(
+        "--disable-eagle",
+        action="store_true",
+        help="measure ordinary target-model decoding without EAGLE3",
+    )
     args = parser.parse_args()
+    if args.prompt_tokens < 1 or args.output_tokens < 1 or args.num_runs < 1:
+        parser.error("prompt, output, and run counts must be positive")
     if args.profile_dir and args.backend != "vllm":
         parser.error("--profile-dir is currently supported only for vllm")
     result = (
@@ -251,7 +273,12 @@ def main() -> None:
         if args.backend == "vllm"
         else run_nanovllm(args)
     )
-    print(json.dumps({"backend": args.backend, **result}, indent=2))
+    result = {"backend": args.backend, **result}
+    serialized = json.dumps(result, indent=2)
+    print(serialized)
+    if args.result_file:
+        with open(args.result_file, "w", encoding="utf-8") as file:
+            file.write(serialized + "\n")
 
 
 if __name__ == "__main__":
