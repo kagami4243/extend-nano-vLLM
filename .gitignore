@@ -199,3 +199,6 @@ cython_debug/
 profiles/
 traces/
 results/
+
+# Local learning notes; keep them outside version control.
+summary.md
