@@ -7,7 +7,7 @@ from nanovllm.layers.linear import ReplicatedLinear
 from nanovllm.layers.quantization import quantize_model
 
 
-def run_linear_test(quantization: str, fp8_format: str = "per_token") -> None:
+def run_linear_test(quantization: str, fp8_format: str = "per_tensor") -> None:
     torch.manual_seed(0)
     dtype = torch.bfloat16
     layer = ReplicatedLinear(256, 128, bias=True).cuda().to(dtype)
@@ -50,7 +50,7 @@ def main() -> None:
         "quantization", choices=("w4a16", "fp8", "all"), default="all", nargs="?"
     )
     parser.add_argument(
-        "--fp8-format", choices=("per_tensor", "per_token"), default="per_token"
+        "--fp8-format", choices=("per_tensor", "per_token"), default="per_tensor"
     )
     args = parser.parse_args()
     methods = ("w4a16", "fp8") if args.quantization == "all" else (args.quantization,)

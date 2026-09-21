@@ -17,9 +17,9 @@
 | --- | --- |
 | 模型支持 | 在 dense Qwen3 之外，支持 Qwen3-MoE 加载和 EAGLE3 draft model 执行 |
 | 并行执行 | Tensor、Pipeline、Data 和 Expert Parallel 的进程组布局 |
-| Cache 与调度 | Prefix reuse、chunked prefill 以及 FP8 E4M3 KV cache 存储 |
+| Cache 与调度 | Prefix reuse、chunked prefill、piecewise CUDA Graph prefill 以及 FP8 E4M3 KV cache 存储 |
 | 解码 | 支持 target/draft KV cache 协同的 greedy EAGLE3 speculative decoding |
-| 低精度 | 面向 dense Qwen3 的在线 W4A16 weight-only 和 FP8 Linear quantization |
+| 低精度 | 面向 dense Qwen3 的在线 W4A16 和 FP8 W8A8 Linear quantization，FP8 默认 per-tensor |
 | GPU kernel | Triton FP8 KV cache store/decode kernel 与 grouped MoE expert GEMM |
 | 验证 | 为新增路径提供 GPU correctness check 和独立 benchmark driver |
 
@@ -73,16 +73,28 @@ python example.py ./models/Qwen3-0.6B
 
 ## 运行选项
 
+### CUDA Graph 执行
+
+支持的单进程 dense Qwen3 workload 默认启用 CUDA Graph。prefill 会捕获 embedding、Linear、
+normalization 和 MLP 等静态片段，attention 因 metadata 动态而保持 eager。图缓存按 prompt
+长度区分；调试时可设置 `enforce_eager=True` 关闭 graph capture。
+
 ### 低精度执行
 
 ```python
 # Group-wise packed INT4 weight，activation 保持 BF16/FP16。
 w4a16 = LLM("./models/Qwen3-0.6B", quantization="w4a16")
 
-# FP8 Linear weight 和 activation。
+# FP8 E4M3 Linear weight 和 activation，默认使用 per-tensor scale。
 fp8 = LLM("./models/Qwen3-0.6B", quantization="fp8")
 
-# 使用 FP8 E4M3 存储 paged K/V tensor。
+# 需要更细 activation 动态范围时可选择 per-token。
+# 此模式 prefill 使用 eager，decode 仍使用 CUDA Graph。
+fp8_per_token = LLM(
+    "./models/Qwen3-0.6B", quantization="fp8", fp8_format="per_token"
+)
+
+# 使用 FP8 E4M3 存储 paged K/V tensor，KV 容量约增加一倍；吞吐影响依模型和 workload 而定。
 fp8_cache = LLM("./models/Qwen3-0.6B", kv_cache_dtype="fp8")
 ```
 
@@ -120,6 +132,7 @@ llm = LLM(
 ```bash
 python -m tests.test_quantization all
 python -m tests.test_fp8_kv_cache
+python -m tests.test_cuda_graph_piece_integration --model ./models/Qwen3-0.6B
 python -m tests.test_moe_kernel
 python -m tests.test_quantized_qwen3 w4a16 --model ./models/Qwen3-0.6B
 ```
@@ -129,6 +142,8 @@ benchmark driver 均显式指定模型路径和 workload：
 ```bash
 python -m benchmarks.bench --model ./models/Qwen3-0.6B
 python -m benchmarks.bench_quantization fp8 --model ./models/Qwen3-0.6B
+python -m benchmarks.bench_cuda_graph_piece --model ./models/Qwen3-0.6B \
+  --prompt-tokens 128 --runs 5
 python -m benchmarks.bench_moe_kernel --tokens 256
 python -m benchmarks.bench_spec_decode_eagle3 nanovllm \
   --target-model ./models/Qwen3-8B \

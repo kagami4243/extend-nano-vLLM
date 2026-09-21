@@ -68,7 +68,6 @@ def main() -> None:
         head_dim**-0.5,
         scale,
         scale,
-        length,
     )
     expanded_key = quantized_key.repeat_interleave(num_heads // num_kv_heads, dim=1)
     expanded_value = quantized_value.repeat_interleave(
@@ -80,7 +79,58 @@ def main() -> None:
     torch.cuda.synchronize()
     max_abs_error = (actual[0].float() - reference).abs().max().item()
     assert max_abs_error <= 2e-3, max_abs_error
-    print(f"FP8 KV cache passed: max_abs={max_abs_error:.6g}")
+
+    # The same graph must read the updated device-side context length. This is
+    # the condition required by model decode graphs reused across requests.
+    graph_context_len = torch.ones(1, dtype=torch.int32, device="cuda")
+    fp8_paged_decode_attention(
+        query,
+        k_cache,
+        v_cache,
+        graph_context_len,
+        block_table,
+        head_dim**-0.5,
+        scale,
+        scale,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = fp8_paged_decode_attention(
+            query,
+            k_cache,
+            v_cache,
+            graph_context_len,
+            block_table,
+            head_dim**-0.5,
+            scale,
+            scale,
+        )
+    graph_errors = []
+    for graph_length in (113, length):
+        graph_context_len.fill_(graph_length)
+        graph.replay()
+        graph_key = quantized_key[:graph_length].repeat_interleave(
+            num_heads // num_kv_heads, dim=1
+        )
+        graph_value = quantized_value[:graph_length].repeat_interleave(
+            num_heads // num_kv_heads, dim=1
+        )
+        graph_scores = torch.einsum(
+            "hd,lhd->hl", query[0].float(), graph_key.float()
+        )
+        graph_weights = torch.softmax(graph_scores * head_dim**-0.5, dim=-1)
+        graph_reference = torch.einsum(
+            "hl,lhd->hd", graph_weights, graph_value.float()
+        )
+        torch.cuda.synchronize()
+        graph_errors.append(
+            (graph_output[0].float() - graph_reference).abs().max().item()
+        )
+    assert max(graph_errors) <= 2e-3, graph_errors
+    print(
+        f"FP8 KV cache passed: max_abs={max_abs_error:.6g}, "
+        f"graph_max_abs={max(graph_errors):.6g}"
+    )
 
 
 if __name__ == "__main__":

@@ -293,7 +293,9 @@ class Qwen3Model(nn.Module):
             q, k, v, residual = piece_runner(
                 "pre", layer, positions, hidden_states, residual
             )
-            attention_output = layer.self_attn.attn(q, k, v)
+            attention_output = piece_runner(
+                "attention", layer.self_attn.attn, q, k, v
+            )
             hidden_states, residual = piece_runner(
                 "post", layer, attention_output, residual
             )
@@ -310,7 +312,9 @@ class Qwen3Model(nn.Module):
             q, k, v, residual = piece_runner(
                 "pre", layer, positions, hidden_states, residual
             )
-            attention_output = layer.self_attn.attn(q, k, v)
+            attention_output = piece_runner(
+                "attention", layer.self_attn.attn, q, k, v
+            )
             hidden_states, residual = piece_runner(
                 "post", layer, attention_output, residual
             )

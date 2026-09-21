@@ -1,4 +1,10 @@
-"""Compare eager and piecewise-prefill TTFT on the same Qwen3 workload."""
+"""Compare eager and piecewise-prefill latency on the same Qwen3 workload.
+
+Two metrics are available. ``ttft`` is the wall time from admitting a request to
+observing its first output token, which is what a client sees. ``prefill-step``
+times only the step that computes the prompt and samples the first token, so it
+excludes the polling and synchronization the TTFT loop adds around it.
+"""
 
 import argparse
 import gc
@@ -52,20 +58,42 @@ def measure_mode(args, mode: str) -> dict:
         samples = []
         for _ in range(args.runs):
             llm.add_request(prompt, sampling)
-            seq = llm.scheduler.waiting[-1]
-            torch.cuda.synchronize()
-            start = perf_counter()
-            first = None
-            while not llm.is_finished():
+            if args.metric == "prefill-step":
+                # The scheduler admits one request per step, so this window is
+                # exactly one prompt computation as long as the step also emits
+                # the first token, which only happens after the full prompt has
+                # been processed.
+                seq = llm.scheduler.waiting[-1]
+                torch.cuda.synchronize()
+                start = perf_counter()
                 llm.step()
                 torch.cuda.synchronize()
-                if first is None and seq.num_completion_tokens:
-                    first = perf_counter()
-            if first is None:
-                raise RuntimeError("request emitted no token")
-            samples.append((first - start) * 1000)
+                if seq.num_completion_tokens < 1:
+                    raise RuntimeError(
+                        "prefill-step expects the prompt step to emit the first "
+                        f"token, got {seq.num_completion_tokens} completion tokens"
+                    )
+                samples.append((perf_counter() - start) * 1000)
+                while not llm.is_finished():
+                    llm.step()
+            else:
+                seq = llm.scheduler.waiting[-1]
+                torch.cuda.synchronize()
+                start = perf_counter()
+                first = None
+                while not llm.is_finished():
+                    llm.step()
+                    torch.cuda.synchronize()
+                    if first is None and seq.num_completion_tokens:
+                        first = perf_counter()
+                if first is None:
+                    raise RuntimeError("request emitted no token")
+                samples.append((first - start) * 1000)
         result = summarize(mode, samples, args.prompt_tokens)
         validate_result(result)
+        result["metric"] = args.metric
+        if args.metric == "prefill-step":
+            result["prefill_step_ms_median"] = result.pop("ttft_ms_median")
         result["prefill_piece_enabled"] = bool(
             llm.model_runner.prefill_piece_enabled
         )
@@ -82,16 +110,20 @@ def measure_mode(args, mode: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="/data0/fwy/Codes/model/Qwen3-0.6B")
+    parser.add_argument("--model", required=True, help="Local Qwen3 model directory")
     parser.add_argument("--prompt-tokens", type=int, default=128)
     parser.add_argument("--output-tokens", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
+    parser.add_argument(
+        "--metric", choices=("ttft", "prefill-step"), default="ttft"
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
     result = {
         "device": torch.cuda.get_device_name(),
+        "metric": args.metric,
         "eager": measure_mode(args, "eager"),
         "piece": measure_mode(args, "piece"),
     }

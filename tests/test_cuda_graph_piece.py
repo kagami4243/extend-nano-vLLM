@@ -97,6 +97,8 @@ def test_prefill_piece_keeps_attention_between_graph_pieces():
         if kind == "pre":
             tensor = torch.ones(1, 1, 2)
             return tensor, tensor, tensor, torch.ones(1, 2)
+        if kind == "attention":
+            return inputs[0]
         if kind == "post":
             return torch.ones(1, 2), torch.ones(1, 2)
         return torch.ones(1, 2), None

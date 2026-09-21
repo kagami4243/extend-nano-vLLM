@@ -15,7 +15,9 @@ import triton.language as tl
 
 SUPPORTED_QUANTIZATIONS = ("w4a16", "fp8")
 FP8_FORMATS = ("per_tensor", "per_token")
-DEFAULT_FP8_FORMAT = "per_token"
+# Per-tensor improves Qwen3-8B prefill on the current Torch scaled_mm kernel.
+# Per-token remains opt-in for its finer activation and weight scales.
+DEFAULT_FP8_FORMAT = "per_tensor"
 W4A16_GROUP_SIZE = 128
 
 

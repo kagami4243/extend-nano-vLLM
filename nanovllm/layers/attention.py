@@ -107,7 +107,6 @@ def fp8_paged_decode_attention_kernel(
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_QUERY_HEADS_PER_KV: tl.constexpr,
-    MAX_CONTEXT_LEN: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """Minimal FP8 paged decode attention, adapted from vLLM Triton attention.
@@ -133,7 +132,10 @@ def fp8_paged_decode_attention_kernel(
     running_sum = tl.full([1], 0.0, tl.float32)
     accumulator = tl.zeros([HEAD_DIM], tl.float32)
     offsets_n = tl.arange(0, BLOCK_N)
-    for start in range(0, MAX_CONTEXT_LEN, BLOCK_N):
+    # Read the loop bound from the graph-stable context_lens buffer. This lets
+    # one captured kernel serve successive requests with different KV lengths.
+    start = 0
+    while start < context_len:
         positions = start + offsets_n
         valid = positions < context_len
         physical_blocks = tl.load(
@@ -169,6 +171,7 @@ def fp8_paged_decode_attention_kernel(
         )
         running_sum = running_sum * previous_scale + tl.sum(weights, axis=0)
         running_max = next_max
+        start += BLOCK_N
 
     tl.store(
         output_ptr
@@ -252,7 +255,6 @@ def fp8_paged_decode_attention(
     scale: float,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
-    max_context_len: int,
 ) -> torch.Tensor:
     """FP8 paged decode wrapper for Qwen's 128-wide attention heads."""
     num_tokens, num_heads, head_dim = q.shape
@@ -285,7 +287,6 @@ def fp8_paged_decode_attention(
         BLOCK_SIZE=k_cache.shape[1],
         HEAD_DIM=head_dim,
         NUM_QUERY_HEADS_PER_KV=num_heads // k_cache.size(2),
-        MAX_CONTEXT_LEN=max_context_len,
         BLOCK_N=64,
         num_warps=4,
     )
@@ -346,7 +347,6 @@ class Attention(nn.Module):
                     self.scale,
                     self.k_scale,
                     self.v_scale,
-                    context.max_seqlen_k,
                 )
             # The scheduler currently issues one prefill request at a time.
             # FA2 cannot read scaled FP8 pages, so gather/dequantize only this

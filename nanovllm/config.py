@@ -68,11 +68,6 @@ class Config:
         assert 1 <= self.pipeline_parallel_size <= 8
         if self.kv_cache_dtype not in ("auto", "fp8"):
             raise ValueError("kv_cache_dtype must be 'auto' or 'fp8'")
-        if self.kv_cache_dtype == "fp8":
-            # The current CUDA graph capture context intentionally contains no
-            # prefill metadata.  FP8 needs a distinct paged-attention kernel,
-            # so keep this first teaching implementation eager and correct.
-            self.enforce_eager = True
         if self.pipeline_parallel_size > 1:
             assert self.enforce_eager, (
                 "the teaching PP implementation currently requires eager mode"

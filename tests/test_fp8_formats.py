@@ -31,8 +31,8 @@ except ImportError as exc:
     )
 
 
-def test_fp8_format_defaults_to_per_token():
-    assert normalize_fp8_format(None) == "per_token"
+def test_fp8_format_defaults_to_per_tensor():
+    assert normalize_fp8_format(None) == "per_tensor"
     assert normalize_fp8_format("per_token") == "per_token"
     assert normalize_fp8_format("PER_TENSOR") == "per_tensor"
     assert FP8_FORMATS == ("per_tensor", "per_token")
@@ -74,7 +74,7 @@ def test_fp8_linear_passes_format_specific_activation_scale(
     assert tuple(calls["scale_b"].shape) == expected_weight_shape
 
 
-def test_fp8_linear_uses_per_token_for_legacy_modules(monkeypatch):
+def test_fp8_linear_uses_default_format_for_legacy_modules(monkeypatch):
     class Module:
         weight = torch.zeros(2, 4, dtype=torch.float8_e4m3fn)
         weight_scale = torch.ones(1, dtype=torch.float32)
@@ -88,7 +88,9 @@ def test_fp8_linear_uses_per_token_for_legacy_modules(monkeypatch):
 
     monkeypatch.setattr(torch, "_scaled_mm", fake_scaled_mm)
     _fp8_linear(torch.ones(1, 2, dtype=torch.bfloat16), Module())
-    assert seen["scale_a_shape"] == (1, 1)
+    # A module without FP8 format metadata falls back to the default format,
+    # which is per-tensor and therefore carries a scalar activation scale.
+    assert seen["scale_a_shape"] == (1,)
 
 
 @pytest.mark.parametrize(

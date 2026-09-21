@@ -18,9 +18,9 @@ studying modern LLM serving systems.
 | --- | --- |
 | Model support | Qwen3-MoE model loading and EAGLE3 draft-model execution alongside dense Qwen3 |
 | Parallel execution | Tensor, pipeline, data, and expert-parallel process-group layouts |
-| Cache and scheduling | Prefix reuse, chunked prefill, and FP8 E4M3 KV-cache storage |
+| Cache and scheduling | Prefix reuse, chunked prefill, piecewise CUDA-Graph prefill, and FP8 E4M3 KV-cache storage |
 | Decoding | Greedy EAGLE3 speculative decoding with target/draft KV-cache coordination |
-| Low precision | Online W4A16 weight-only and FP8 linear-weight quantization for dense Qwen3 |
+| Low precision | Online W4A16 and FP8 W8A8 linear quantization for dense Qwen3, with per-tensor FP8 as the default |
 | GPU kernels | Triton FP8 KV-cache store/decode kernels and grouped MoE expert GEMMs |
 | Validation | GPU correctness checks and standalone benchmark drivers for the added paths |
 
@@ -75,16 +75,31 @@ python example.py ./models/Qwen3-0.6B
 
 ## Runtime options
 
+### CUDA Graph execution
+
+CUDA Graph is enabled by default for supported single-process dense Qwen3
+workloads. Prefill captures embedding, linear, normalization, and MLP pieces,
+while attention keeps its dynamic metadata on the eager path. The graph cache
+is keyed by prompt length. Set `enforce_eager=True` to disable graph capture
+when debugging.
+
 ### Low-precision execution
 
 ```python
 # Group-wise packed INT4 weights with BF16/FP16 activations.
 w4a16 = LLM("./models/Qwen3-0.6B", quantization="w4a16")
 
-# FP8 linear weights and activations.
+# FP8 E4M3 linear weights and activations. Per-tensor scale is the default.
 fp8 = LLM("./models/Qwen3-0.6B", quantization="fp8")
 
-# Store paged K/V tensors in FP8 E4M3.
+# Per-token activation scales are available when their finer dynamic range is
+# required. Prefill runs eagerly for this mode; decode still uses CUDA Graph.
+fp8_per_token = LLM(
+    "./models/Qwen3-0.6B", quantization="fp8", fp8_format="per_token"
+)
+
+# Store paged K/V tensors in FP8 E4M3. This approximately doubles KV capacity;
+# its throughput effect depends on the model and workload.
 fp8_cache = LLM("./models/Qwen3-0.6B", kv_cache_dtype="fp8")
 ```
 
@@ -123,6 +138,7 @@ Run the focused GPU checks from the repository root:
 ```bash
 python -m tests.test_quantization all
 python -m tests.test_fp8_kv_cache
+python -m tests.test_cuda_graph_piece_integration --model ./models/Qwen3-0.6B
 python -m tests.test_moe_kernel
 python -m tests.test_quantized_qwen3 w4a16 --model ./models/Qwen3-0.6B
 ```
@@ -132,6 +148,8 @@ Benchmark drivers keep model paths and workload sizes explicit:
 ```bash
 python -m benchmarks.bench --model ./models/Qwen3-0.6B
 python -m benchmarks.bench_quantization fp8 --model ./models/Qwen3-0.6B
+python -m benchmarks.bench_cuda_graph_piece --model ./models/Qwen3-0.6B \
+  --prompt-tokens 128 --runs 5
 python -m benchmarks.bench_moe_kernel --tokens 256
 python -m benchmarks.bench_spec_decode_eagle3 nanovllm \
   --target-model ./models/Qwen3-8B \

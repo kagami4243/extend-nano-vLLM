@@ -1,3 +1,4 @@
+import gc
 import pickle
 import torch
 import torch.distributed as dist
@@ -27,6 +28,69 @@ from nanovllm.layers.quantization import quantize_model
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.models.eagle3 import Eagle3KVCache, load_eagle3_model
+
+
+class _BreakablePrefillCapture:
+    """Capture graph segments separated by eager attention calls."""
+
+    def __init__(self, pool=None, stream=None):
+        self.pool = pool
+        self.stream = stream or torch.cuda.Stream()
+        self.segments = []
+        self.buffers = []
+        self._graph = None
+
+    def _begin_graph(self):
+        if self._graph is not None:
+            return
+        graph = torch.cuda.CUDAGraph()
+        if self.pool is None:
+            graph.capture_begin()
+        else:
+            graph.capture_begin(pool=self.pool)
+        self._graph = graph
+
+    def _end_graph(self):
+        if self._graph is None:
+            return
+        self._graph.capture_end()
+        if self.pool is None:
+            self.pool = self._graph.pool()
+        self.segments.append(self._graph.replay)
+        self._graph = None
+
+    def ensure_graph(self):
+        """Start a graph only when a graphable piece is about to run."""
+        self._begin_graph()
+
+    def capture(self, fn):
+        caller_stream = torch.cuda.current_stream()
+        self.stream.wait_stream(caller_stream)
+        with torch.cuda.stream(self.stream):
+            self._begin_graph()
+            try:
+                output = fn()
+            finally:
+                self._end_graph()
+        caller_stream.wait_stream(self.stream)
+        return output
+
+    def add_eager(self, fn, *args):
+        self._end_graph()
+        eager_output = fn(*args)
+        output = torch.empty_like(eager_output)
+        output.copy_(eager_output)
+        self.buffers.append((args, output))
+
+        def replay_eager():
+            output.copy_(fn(*args))
+
+        self.segments.append(replay_eager)
+        return output
+
+    def replay(self):
+        for segment in self.segments:
+            segment()
 
 
 class ModelRunner:
@@ -92,6 +156,8 @@ class ModelRunner:
         self.eagle_graph_vars = {}
         self.prefill_piece_enabled = False
         self.prefill_piece_graphs = {}
+        self.prefill_piece_graph_pool = None
+        self.prefill_piece_capture_stream = torch.cuda.Stream()
         if self.speculative_config is not None:
             if hf_config.model_type != "qwen3":
                 raise ValueError("EAGLE3 speculative decoding currently requires Qwen3")
@@ -447,112 +513,102 @@ class ModelRunner:
             raise ValueError("prefill piece token count must be positive")
         return int(token_count)
 
-    def _capture_prefill_piece_graph(self, token_count: int):
-        """Capture all non-attention pieces for one static prefill length."""
-        if token_count in self.prefill_piece_graphs:
-            return self.prefill_piece_graphs[token_count]
+    @staticmethod
+    def _run_prefill_piece(kind, module, *inputs):
+        if kind == "pre":
+            return module.prefill_pre(*inputs)
+        if kind == "post":
+            return module.prefill_post(*inputs)
+        return module(*inputs)
+
+    def _capture_prefill_piece_graph(
+        self,
+        token_count: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        aux_hidden_state_layers=None,
+    ):
+        """Capture one forward as graph segments separated by eager attention."""
+        variants = self.prefill_piece_graphs.setdefault(token_count, {})
+        variant_key = (
+            None
+            if aux_hidden_state_layers is None
+            else tuple(aux_hidden_state_layers)
+        )
+        if variant_key in variants:
+            return variants[variant_key]
         if self.enforce_eager:
             return None
         model = self.model.model
-        dtype = self.config.hf_config.torch_dtype
-        hidden_size = self.config.hf_config.hidden_size
         device = torch.device("cuda", self.device_index)
-        positions = torch.arange(token_count, dtype=torch.int64, device=device)
-        pool = getattr(self, "prefill_piece_graph_pool", None)
-        pieces = {"embed": None, "layers": [], "norm": None}
+        static_input_ids = torch.empty(token_count, dtype=torch.int64, device=device)
+        static_positions = torch.empty(token_count, dtype=torch.int64, device=device)
+        static_input_ids.copy_(input_ids)
+        static_positions.copy_(positions)
 
-        def capture(fn, inputs):
-            nonlocal pool
-            graph = torch.cuda.CUDAGraph()
-            fn(*inputs)
-            with torch.cuda.graph(graph, pool):
-                outputs = fn(*inputs)
-            if pool is None:
-                pool = graph.pool()
-            return graph, inputs, outputs
+        def eager_piece_runner(kind, module, *inputs):
+            return self._run_prefill_piece(kind, module, *inputs)
 
-        input_ids = torch.zeros(token_count, dtype=torch.int64, device=device)
-        pieces["embed"] = capture(model.embed_tokens, (input_ids,))
-        residual = torch.zeros(token_count, hidden_size, dtype=dtype, device=device)
-        hidden = torch.zeros_like(residual)
-        for layer_index, layer in enumerate(model.layers.values()):
-            pre_inputs = (positions, hidden, residual)
-            pre_fn = (
-                (lambda pos, states, _residual, layer=layer:
-                 layer.prefill_pre(pos, states, None))
-                if layer_index == 0 else layer.prefill_pre
+        def forward(piece_runner):
+            if aux_hidden_state_layers is None:
+                return model.forward_prefill_piece(
+                    static_input_ids, static_positions, piece_runner
+                )
+            return model.forward_prefill_piece_with_aux(
+                static_input_ids,
+                static_positions,
+                piece_runner,
+                aux_hidden_state_layers,
             )
-            pre_graph = capture(pre_fn, pre_inputs)
-            q, k, v, residual_out = pre_graph[2]
-            post_attention = torch.zeros(
-                token_count,
-                layer.self_attn.num_heads,
-                layer.self_attn.head_dim,
-                dtype=dtype,
-                device=device,
-            )
-            post_graph = capture(layer.prefill_post, (post_attention, residual_out))
-            hidden = post_graph[2][0]
-            residual = post_graph[2][1]
-            pieces["layers"].append((pre_graph, post_graph))
-        norm_graph = capture(model.norm, (hidden, residual))
-        pieces["norm"] = norm_graph
-        self.prefill_piece_graph_pool = pool
-        self.prefill_piece_graphs[token_count] = pieces
-        return pieces
+
+        # Compile kernels and establish allocator state before stream capture.
+        forward(eager_piece_runner)
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        capture = _BreakablePrefillCapture(
+            self.prefill_piece_graph_pool, self.prefill_piece_capture_stream
+        )
+
+        def capture_piece_runner(kind, module, *inputs):
+            if kind == "attention":
+                return capture.add_eager(module, *inputs)
+            capture.ensure_graph()
+            return self._run_prefill_piece(kind, module, *inputs)
+
+        output = capture.capture(lambda: forward(capture_piece_runner))
+        self.prefill_piece_graph_pool = capture.pool
+        entry = {
+            "capture": capture,
+            "input_ids": static_input_ids,
+            "positions": static_positions,
+            "output": output,
+        }
+        variants[variant_key] = entry
+        return entry
 
     def run_prefill_piece(
         self, input_ids: torch.Tensor, positions: torch.Tensor,
         aux_hidden_state_layers=None,
     ):
         token_count = input_ids.numel()
-        pieces = self._capture_prefill_piece_graph(
-            self.prefill_piece_cache_key(token_count)
+        entry = self._capture_prefill_piece_graph(
+            self.prefill_piece_cache_key(token_count),
+            input_ids,
+            positions,
+            aux_hidden_state_layers,
         )
-        if pieces is None:
+        if entry is None:
             if aux_hidden_state_layers is None:
                 return self.model(input_ids, positions)
             return self.model.forward_with_aux_hidden_states(
                 input_ids, positions, aux_hidden_state_layers
             )
-
-        def piece_runner(kind, module, *inputs):
-            if kind == "embed":
-                graph, graph_inputs, outputs = pieces["embed"]
-                graph_inputs[0].copy_(inputs[0])
-                graph.replay()
-                return outputs
-            if kind == "pre":
-                index = list(self.model.model.layers.values()).index(module)
-                graph, graph_inputs, outputs = pieces["layers"][index][0]
-                graph_inputs[0].copy_(inputs[0])
-                graph_inputs[1].copy_(inputs[1])
-                if inputs[2] is None:
-                    graph_inputs[2].zero_()
-                else:
-                    graph_inputs[2].copy_(inputs[2])
-                graph.replay()
-                return outputs
-            if kind == "post":
-                index = list(self.model.model.layers.values()).index(module)
-                graph, graph_inputs, outputs = pieces["layers"][index][1]
-                graph_inputs[0].copy_(inputs[0])
-                graph_inputs[1].copy_(inputs[1])
-                graph.replay()
-                return outputs
-            graph, graph_inputs, outputs = pieces["norm"]
-            graph_inputs[0].copy_(inputs[0])
-            graph_inputs[1].copy_(inputs[1])
-            graph.replay()
-            return outputs
-
-        if aux_hidden_state_layers is None:
-            return self.model.model.forward_prefill_piece(
-                input_ids, positions, piece_runner
-            )
-        return self.model.model.forward_prefill_piece_with_aux(
-            input_ids, positions, piece_runner, aux_hidden_state_layers
-        )
+        entry["input_ids"].copy_(input_ids)
+        entry["positions"].copy_(positions)
+        entry["capture"].replay()
+        return entry["output"]
 
     def get_eagle3_runtime_capabilities(self):
         return {
@@ -941,13 +997,27 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [size for size in (1, 2, 4, 8) if size <= max_bs]
+        self.graph_bs += list(range(16, max_bs + 1, 16))
+        if max_bs not in self.graph_bs:
+            self.graph_bs.append(max_bs)
+        self.graph_bs = sorted(set(self.graph_bs))
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            # Capture a valid one-token decode path. Dynamic metadata is copied
+            # into these stable buffers before every replay.
+            context_lens[:bs].fill_(1)
+            set_context(
+                False,
+                max_seqlen_q=1,
+                max_seqlen_k=1,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+            )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
@@ -970,6 +1040,13 @@ class ModelRunner:
             and self.pp_size == 1
             and self.config.hf_config.model_type == "qwen3"
             and hasattr(self.model.model, "forward_prefill_piece")
+            # Rowwise torch._scaled_mm is unsafe in the breakable prefill
+            # capture on the supported Torch/CUDA stack. Decode still uses
+            # the complete CUDA graph captured above.
+            and not (
+                self.config.quantization == "fp8"
+                and self.config.fp8_format == "per_token"
+            )
         )
         if self.eagle3_model is not None:
             self._capture_eagle3_graphs(max_num_blocks)

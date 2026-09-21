@@ -16,7 +16,7 @@ def main() -> None:
     parser.add_argument("--target-model", help="Target model directory for EAGLE3")
     parser.add_argument("--draft-model", help="EAGLE3 draft model directory")
     parser.add_argument(
-        "--fp8-format", choices=("per_tensor", "per_token"), default="per_token"
+        "--fp8-format", choices=("per_tensor", "per_token"), default="per_tensor"
     )
     args = parser.parse_args()
     if args.speculative:

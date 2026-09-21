@@ -110,7 +110,9 @@ def run_nanovllm(args) -> dict[str, float | int]:
     try:
         measure_nanovllm_request(
             llm,
-            make_prompt_token_ids(args.target_model, WARMUP_PROMPT_TOKENS),
+            # Capture the same piecewise-prefill shape before timing. A short
+            # warmup would otherwise charge first-use graph capture to TTFT.
+            make_prompt_token_ids(args.target_model, args.prompt_tokens),
             WARMUP_OUTPUT_TOKENS,
         )
         acceptance["drafted"] = 0
@@ -274,6 +276,8 @@ def main() -> None:
         else run_nanovllm(args)
     )
     result = {"backend": args.backend, **result}
+    if args.backend == "nanovllm":
+        result["cuda_graph"] = True
     serialized = json.dumps(result, indent=2)
     print(serialized)
     if args.result_file:
