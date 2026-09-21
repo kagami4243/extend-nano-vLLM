@@ -7,7 +7,7 @@ from nanovllm.layers.linear import ReplicatedLinear
 from nanovllm.layers.quantization import quantize_model
 
 
-def run_linear_test(quantization: str) -> None:
+def run_linear_test(quantization: str, fp8_format: str = "per_token") -> None:
     torch.manual_seed(0)
     dtype = torch.bfloat16
     layer = ReplicatedLinear(256, 128, bias=True).cuda().to(dtype)
@@ -18,7 +18,7 @@ def run_linear_test(quantization: str) -> None:
     reference = F.linear(x, layer.weight, layer.bias)
     original_weight_bytes = layer.weight.numel() * layer.weight.element_size()
 
-    quantize_model(layer, quantization)
+    quantize_model(layer, quantization, fp8_format=fp8_format)
     output = layer(x)
     cosine = F.cosine_similarity(
         output.float().flatten(), reference.float().flatten(), dim=0
@@ -39,7 +39,7 @@ def run_linear_test(quantization: str) -> None:
     threshold = 0.990 if quantization == "w4a16" else 0.999
     assert cosine >= threshold, (quantization, cosine)
     print(
-        f"{quantization}: cosine={cosine:.6f}, "
+        f"{quantization}/{fp8_format}: cosine={cosine:.6f}, "
         f"weight_bytes={original_weight_bytes}->{quantized_weight_bytes}"
     )
 
@@ -49,10 +49,13 @@ def main() -> None:
     parser.add_argument(
         "quantization", choices=("w4a16", "fp8", "all"), default="all", nargs="?"
     )
+    parser.add_argument(
+        "--fp8-format", choices=("per_tensor", "per_token"), default="per_token"
+    )
     args = parser.parse_args()
     methods = ("w4a16", "fp8") if args.quantization == "all" else (args.quantization,)
     for method in methods:
-        run_linear_test(method)
+        run_linear_test(method, args.fp8_format)
 
 
 if __name__ == "__main__":

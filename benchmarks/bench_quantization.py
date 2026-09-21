@@ -10,6 +10,7 @@ are materially more favorable to quantized GEMMs than batch-1 decoding.
 import argparse
 import gc
 import json
+from types import SimpleNamespace
 from time import perf_counter
 
 import torch
@@ -30,9 +31,35 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--decode-tokens", type=int, default=64)
+    parser.add_argument(
+        "--backend", choices=("nanovllm", "vllm"), default="nanovllm"
+    )
+    parser.add_argument(
+        "--fp8-format", choices=("per_tensor", "per_token"), default="per_token"
+    )
     args = parser.parse_args()
     if args.batch_size < 1 or args.prompt_tokens < 1 or args.decode_tokens < 1:
         parser.error("batch size, prompt tokens, and decode tokens must be positive")
+
+    if args.backend == "vllm":
+        if args.quantization != "fp8":
+            parser.error("the vllm backend currently supports only fp8")
+        if args.fp8_format != "per_token":
+            parser.error("the vllm backend uses per_token FP8 activation quantization")
+        from benchmarks.bench_fp8_compare import measure_vllm
+
+        result = measure_vllm(
+            SimpleNamespace(
+                model=args.model,
+                prompt_tokens=args.prompt_tokens,
+                decode_tokens=args.decode_tokens,
+                batch_size=args.batch_size,
+                gpu_memory_utilization=0.8,
+                fp8_format=args.fp8_format,
+            )
+        )
+        print(json.dumps(result, indent=2))
+        return
 
     from nanovllm import LLM, SamplingParams
 
@@ -41,6 +68,7 @@ def main() -> None:
     llm = LLM(
         args.model,
         quantization=quantization,
+        fp8_format=args.fp8_format,
         # Eager removes CUDA graph capture/replay as a benchmark variable.
         enforce_eager=True,
         max_model_len=max_model_len,
@@ -89,6 +117,7 @@ def main() -> None:
         result = {
             "model": args.model,
             "quantization": args.quantization,
+            "fp8_format": args.fp8_format,
             "enforce_eager": True,
             "batch_size": args.batch_size,
             "prompt_tokens_per_request": args.prompt_tokens,

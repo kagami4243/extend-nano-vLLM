@@ -2,7 +2,11 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
-from nanovllm.layers.quantization import normalize_quantization
+from nanovllm.layers.quantization import (
+    DEFAULT_FP8_FORMAT,
+    normalize_fp8_format,
+    normalize_quantization,
+)
 
 
 @dataclass
@@ -53,6 +57,7 @@ class Config:
     kv_cache_dtype: str = "auto"
     speculative_config: SpeculativeConfig | dict | None = None
     quantization: str | None = None
+    fp8_format: str = DEFAULT_FP8_FORMAT
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -79,6 +84,7 @@ class Config:
         assert self.device_offset >= 0
         assert self.max_num_batched_tokens > 0
         self.quantization = normalize_quantization(self.quantization)
+        self.fp8_format = normalize_fp8_format(self.fp8_format)
         if isinstance(self.speculative_config, dict):
             self.speculative_config = SpeculativeConfig(**self.speculative_config)
         if self.speculative_config is not None:

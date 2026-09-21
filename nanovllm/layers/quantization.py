@@ -14,6 +14,8 @@ import triton.language as tl
 
 
 SUPPORTED_QUANTIZATIONS = ("w4a16", "fp8")
+FP8_FORMATS = ("per_tensor", "per_token")
+DEFAULT_FP8_FORMAT = "per_token"
 W4A16_GROUP_SIZE = 128
 
 
@@ -29,6 +31,21 @@ def normalize_quantization(quantization: str | None) -> str | None:
             f"unsupported quantization {quantization!r}; supported: {supported}"
         )
     return quantization
+
+
+def normalize_fp8_format(fp8_format: str | None) -> str:
+    """Normalize activation scale granularity for online FP8 quantization."""
+    if fp8_format is None:
+        return DEFAULT_FP8_FORMAT
+    if not isinstance(fp8_format, str):
+        raise TypeError("fp8_format must be a string or None")
+    fp8_format = fp8_format.lower()
+    if fp8_format not in FP8_FORMATS:
+        supported = ", ".join(FP8_FORMATS)
+        raise ValueError(
+            f"unsupported fp8_format {fp8_format!r}; supported: {supported}"
+        )
+    return fp8_format
 
 
 @triton.jit
@@ -143,7 +160,8 @@ def _quantize_w4a16(module: nn.Module, group_size: int) -> None:
 
 
 @torch.inference_mode()
-def _quantize_fp8(module: nn.Module) -> None:
+def _quantize_fp8(module: nn.Module, fp8_format: str | None = None) -> None:
+    fp8_format = normalize_fp8_format(fp8_format)
     if not hasattr(torch, "_scaled_mm"):
         raise RuntimeError("FP8 quantization requires torch._scaled_mm")
     if module.weight.device.type == "cuda":
@@ -153,13 +171,27 @@ def _quantize_fp8(module: nn.Module) -> None:
 
     weight = module.weight.detach()
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    scale = weight.float().abs().amax().clamp_min(1e-12) / fp8_max
+    if fp8_format == "per_token":
+        # Rowwise quantization of the source [N, K] weight becomes a
+        # [1, N] channel scale after the GEMM operand is transposed to [K, N].
+        scale = (
+            weight.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+            / fp8_max
+        )
+    else:
+        scale = weight.float().abs().amax().clamp_min(1e-12) / fp8_max
     quantized = (weight.float() / scale).clamp(-fp8_max, fp8_max)
     # torch._scaled_mm expects B as [K, N]. Keep this transposed view
     # column-major, matching vLLM's online FP8 post-load conversion.
     _replace_weight(module, quantized.to(torch.float8_e4m3fn).t())
-    module.register_buffer("weight_scale", scale.float().reshape(1))
+    weight_scale = (
+        scale.float().reshape(1)
+        if fp8_format == "per_tensor"
+        else scale.float().t().contiguous()
+    )
+    module.register_buffer("weight_scale", weight_scale)
     module.quantization = "fp8"
+    module.fp8_activation_format = fp8_format
     module.input_size_per_partition = weight.shape[1]
     module.output_size_per_partition = weight.shape[0]
 
@@ -170,6 +202,7 @@ def quantize_model(
     quantization: str | None,
     *,
     w4a16_group_size: int = W4A16_GROUP_SIZE,
+    fp8_format: str | None = None,
 ) -> None:
     """Quantize loaded LinearBase weights in place.
 
@@ -179,6 +212,8 @@ def quantize_model(
     quantization = normalize_quantization(quantization)
     if quantization is None:
         return
+    if quantization == "fp8":
+        fp8_format = normalize_fp8_format(fp8_format)
 
     from nanovllm.layers.linear import LinearBase
 
@@ -188,7 +223,7 @@ def quantize_model(
         if quantization == "w4a16":
             _quantize_w4a16(module, w4a16_group_size)
         else:
-            _quantize_fp8(module)
+            _quantize_fp8(module, fp8_format)
 
 
 def _w4a16_linear(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -239,16 +274,42 @@ def _fp8_linear(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
     original_shape = x.shape
     x_2d = x.reshape(-1, original_shape[-1]).contiguous()
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    input_scale = x_2d.float().abs().amax().clamp_min(1e-12) / fp8_max
+    fp8_format = normalize_fp8_format(
+        getattr(module, "fp8_activation_format", DEFAULT_FP8_FORMAT)
+    )
+    if fp8_format == "per_token":
+        input_scale = (
+            x_2d.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+            / fp8_max
+        )
+    else:
+        input_scale = x_2d.float().abs().amax().clamp_min(1e-12) / fp8_max
     x_fp8 = (x_2d.float() / input_scale).clamp(-fp8_max, fp8_max)
     x_fp8 = x_fp8.to(torch.float8_e4m3fn)
-    output = torch._scaled_mm(
-        x_fp8,
-        module.weight,
-        scale_a=input_scale.float().reshape(1),
-        scale_b=module.weight_scale,
-        out_dtype=x.dtype,
-    )
+    scale_a = input_scale.float()
+    if fp8_format == "per_tensor":
+        scale_a = scale_a.reshape(1)
+    try:
+        output = torch._scaled_mm(
+            x_fp8,
+            module.weight,
+            scale_a=scale_a,
+            scale_b=module.weight_scale,
+            out_dtype=x.dtype,
+        )
+    except RuntimeError as scaled_mm_error:
+        if fp8_format != "per_token":
+            raise
+        # Some CUDA/Torch combinations expose scaled_mm but do not implement
+        # rowwise scale_a. Keep per-token semantics correct on those builds;
+        # a native rowwise kernel can be selected without changing the API.
+        try:
+            output = torch.mm(
+                x_fp8.float() * scale_a,
+                module.weight.float() * module.weight_scale,
+            ).to(x.dtype)
+        except Exception:
+            raise scaled_mm_error
     if isinstance(output, tuple):
         output = output[0]
     return output.view(*original_shape[:-1], module.output_size_per_partition)

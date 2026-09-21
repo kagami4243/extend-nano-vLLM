@@ -98,6 +98,16 @@ class Qwen3Attention(nn.Module):
         output = self.o_proj(o.flatten(1, -1))
         return output
 
+    def forward_prefill_pre(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the non-attention input side of a prefill attention block."""
+        return self.project_qkv(positions, hidden_states)
+
+    def forward_prefill_post(self, attention_output: torch.Tensor) -> torch.Tensor:
+        """Run the non-attention output projection after eager attention."""
+        return self.o_proj(attention_output.flatten(1, -1))
+
 
 class Qwen3MLP(nn.Module):
 
@@ -166,6 +176,29 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+    def prefill_pre(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        q, k, v = self.self_attn.forward_prefill_pre(positions, hidden_states)
+        return q, k, v, residual
+
+    def prefill_post(
+        self, attention_output: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.self_attn.forward_prefill_post(attention_output)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -244,6 +277,48 @@ class Qwen3Model(nn.Module):
         if len(aux_hidden_states) != len(aux_hidden_state_layers):
             raise ValueError("requested EAGLE3 auxiliary layer is unavailable")
         hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states, torch.cat(aux_hidden_states, dim=-1)
+
+    def forward_prefill_piece(self, input_ids, positions, piece_runner):
+        """Prefill with eager attention and graphable surrounding operations.
+
+        ``piece_runner`` owns CUDA-graph capture/replay. Keeping the attention
+        call here makes the cache metadata and FlashAttention launch identical
+        to the eager path while allowing every projection, norm, activation,
+        embedding, and final norm to run from static graph buffers.
+        """
+        hidden_states = piece_runner("embed", self.embed_tokens, input_ids)
+        residual = None
+        for layer in self.layers.values():
+            q, k, v, residual = piece_runner(
+                "pre", layer, positions, hidden_states, residual
+            )
+            attention_output = layer.self_attn.attn(q, k, v)
+            hidden_states, residual = piece_runner(
+                "post", layer, attention_output, residual
+            )
+        hidden_states, _ = piece_runner("norm", self.norm, hidden_states, residual)
+        return hidden_states
+
+    def forward_prefill_piece_with_aux(
+        self, input_ids, positions, piece_runner, aux_hidden_state_layers
+    ):
+        hidden_states = piece_runner("embed", self.embed_tokens, input_ids)
+        residual = None
+        aux_hidden_states = []
+        for layer_id, layer in enumerate(self.layers.values(), start=1):
+            q, k, v, residual = piece_runner(
+                "pre", layer, positions, hidden_states, residual
+            )
+            attention_output = layer.self_attn.attn(q, k, v)
+            hidden_states, residual = piece_runner(
+                "post", layer, attention_output, residual
+            )
+            if layer_id in aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
+        hidden_states, _ = piece_runner("norm", self.norm, hidden_states, residual)
+        if len(aux_hidden_states) != len(aux_hidden_state_layers):
+            raise ValueError("requested EAGLE3 auxiliary layer is unavailable")
         return hidden_states, torch.cat(aux_hidden_states, dim=-1)
 
 

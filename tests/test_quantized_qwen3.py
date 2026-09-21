@@ -15,6 +15,9 @@ def main() -> None:
     parser.add_argument("--speculative", action="store_true")
     parser.add_argument("--target-model", help="Target model directory for EAGLE3")
     parser.add_argument("--draft-model", help="EAGLE3 draft model directory")
+    parser.add_argument(
+        "--fp8-format", choices=("per_tensor", "per_token"), default="per_token"
+    )
     args = parser.parse_args()
     if args.speculative:
         if not args.target_model or not args.draft_model:
@@ -26,6 +29,7 @@ def main() -> None:
     llm = LLM(
         args.target_model if args.speculative else args.model,
         quantization=quantization,
+        fp8_format=args.fp8_format,
         enforce_eager=not args.cuda_graph,
         max_model_len=128,
         max_num_batched_tokens=128,
@@ -48,12 +52,22 @@ def main() -> None:
             if isinstance(module, LinearBase)
         ]
         assert layers and all(layer.quantization == quantization for layer in layers)
+        if quantization == "fp8":
+            assert all(
+                layer.fp8_activation_format == args.fp8_format for layer in layers
+            )
         output = llm.generate(
             [[1, 2, 3, 4]],
             SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=8),
             use_tqdm=False,
         )[0]
         assert len(output["token_ids"]) == 8
+        if args.speculative:
+            capabilities = llm.model_runner.get_eagle3_runtime_capabilities()
+            assert capabilities["paged_kv_cache"] is True
+            if args.cuda_graph:
+                assert capabilities["cuda_graph"] is True
+                assert capabilities["graph_batch_sizes"]
         parameter_bytes = sum(
             parameter.numel() * parameter.element_size()
             for parameter in llm.model_runner.model.parameters()
