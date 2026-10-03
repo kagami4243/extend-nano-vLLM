@@ -11,8 +11,10 @@ functional reference path when practical.
 ## Development guidelines
 
 1. Keep CUDA, model, and checkpoint assumptions explicit in code and docs.
-2. Add a focused test under `tests/` for behavior changes. GPU tests should be
-   runnable as `python -m tests.<module>`.
+2. Add a focused test under `tests/` for behavior changes. Contract and layer
+   tests use pytest; real-model GPU integration drivers can use
+   `python -m tests.<module>`. Configuration contracts use temporary config-only
+   checkpoints rather than requiring private model paths.
 3. Put reproducible timing scripts in `benchmarks/`; report hardware, model,
    workload, warm-up, and what the measurement excludes.
 4. Preserve numerical reference paths when adding a kernel where practical.

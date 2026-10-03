@@ -10,6 +10,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.context import get_context
 
 
 class Qwen3Attention(nn.Module):
@@ -27,6 +28,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
         qkv_input_size: int | None = None,
         use_qk_norm: bool | None = None,
+        eager_qk_norm_prefill: bool = False,
     ) -> None:
         super().__init__()
         tp_size = get_tp_world_size()
@@ -42,6 +44,7 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
         self.use_qk_norm = not qkv_bias if use_qk_norm is None else use_qk_norm
+        self.eager_qk_norm_prefill = eager_qk_norm_prefill
 
         self.qkv_proj = QKVParallelLinear(
             qkv_input_size or hidden_size,
@@ -83,8 +86,14 @@ class Qwen3Attention(nn.Module):
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            # Compiled BF16 Q/K norm changes MoE prefill routing on sensitive inputs.
+            if (self.eager_qk_norm_prefill and get_context().is_prefill
+                    and not self.q_norm.deterministic_cuda):
+                q = self.q_norm.rms_forward_eager(q)
+                k = self.k_norm.rms_forward_eager(k)
+            else:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 

@@ -1,4 +1,5 @@
 import re
+import os
 
 import torch
 from torch import nn
@@ -25,6 +26,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         layer_id: int,
         ep_rank: int,
         ep_size: int,
+        dispatch_backend: str,
+        expert_capacity: int | None,
+        graph_safe_decode: bool,
+        expert_owners: tuple[int, ...] | None,
+        expert_capacity_factor: float | None = None,
+        dynamic_placement: bool = False,
     ) -> None:
         super().__init__()
         if config.hidden_act != "silu":
@@ -39,7 +46,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            eager_qk_norm_prefill=ep_size == 1,
         )
+        if (self.self_attn.use_qk_norm
+                and os.environ.get("NANOVLLM_EXPERIMENTAL_DETERMINISTIC_QK_NORM") == "1"):
+            self.self_attn.q_norm.deterministic_cuda = True
+            self.self_attn.k_norm.deterministic_cuda = True
         uses_moe = (
             layer_id not in getattr(config, "mlp_only_layers", [])
             and config.num_experts > 0
@@ -54,6 +66,18 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 norm_topk_prob=config.norm_topk_prob,
                 ep_rank=ep_rank,
                 ep_size=ep_size,
+                dispatch_backend=dispatch_backend,
+                expert_capacity=expert_capacity,
+                graph_safe_decode=graph_safe_decode,
+                expert_owners=expert_owners,
+                expert_capacity_factor=expert_capacity_factor,
+                shared_expert_intermediate_size=getattr(
+                    config, "shared_expert_intermediate_size", None
+                ),
+                shared_expert_tp_sharded=getattr(
+                    config, "shared_expert_tp_sharded", False
+                ),
+                dynamic_placement=dynamic_placement,
             )
         else:
             self.mlp = Qwen3MLP(
@@ -90,6 +114,25 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+    def prefill_pre(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        q, k, v = self.self_attn.forward_prefill_pre(positions, hidden_states)
+        return q, k, v, residual
+
+    def prefill_post(
+        self, attention_output: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.self_attn.forward_prefill_post(attention_output)
+        return self.post_attention_layernorm(hidden_states, residual)
+
 
 class Qwen3MoeModel(nn.Module):
 
@@ -100,6 +143,12 @@ class Qwen3MoeModel(nn.Module):
         pp_size: int = 1,
         ep_rank: int = 0,
         ep_size: int = 1,
+        dispatch_backend: str = "replicated",
+        expert_capacity: int | None = None,
+        graph_safe_decode: bool = False,
+        expert_placement: dict[str, tuple[int, ...]] | None = None,
+        expert_capacity_factor: float | None = None,
+        dynamic_placement: bool = False,
     ) -> None:
         super().__init__()
         layers_per_stage = config.num_hidden_layers // pp_size
@@ -115,7 +164,11 @@ class Qwen3MoeModel(nn.Module):
         self.layers = nn.ModuleDict(
             {
                 str(layer_id): Qwen3MoeDecoderLayer(
-                    config, layer_id, ep_rank, ep_size
+                    config, layer_id, ep_rank, ep_size,
+                    dispatch_backend, expert_capacity, graph_safe_decode,
+                    None if expert_placement is None else expert_placement.get(str(layer_id)),
+                    expert_capacity_factor,
+                    dynamic_placement,
                 )
                 for layer_id in range(self.start_layer, self.end_layer)
             }
@@ -153,6 +206,24 @@ class Qwen3MoeModel(nn.Module):
         hidden_states, _ = self.forward_stage(input_ids, positions)
         return hidden_states
 
+    def forward_prefill_piece(self, input_ids, positions, piece_runner):
+        hidden_states = piece_runner("embed", self.embed_tokens, input_ids)
+        residual = None
+        for layer in self.layers.values():
+            q, k, v, residual = piece_runner(
+                "pre", layer, positions, hidden_states, residual
+            )
+            attention_output = piece_runner(
+                "attention", layer.self_attn.attn, q, k, v
+            )
+            hidden_states, residual = piece_runner(
+                "post", layer, attention_output, residual
+            )
+            kind = "moe" if isinstance(layer.mlp, ExpertParallelMoE) else "mlp"
+            hidden_states = piece_runner(kind, layer.mlp, hidden_states)
+        hidden_states, _ = piece_runner("norm", self.norm, hidden_states, residual)
+        return hidden_states
+
 
 class Qwen3MoeForCausalLM(nn.Module):
     packed_modules_mapping = {
@@ -161,6 +232,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
         ".mlp.up_proj": (".mlp.gate_up_proj", 1),
+        ".mlp.shared_expert.gate_proj": (
+            ".mlp.shared_expert.gate_up_proj", 0
+        ),
+        ".mlp.shared_expert.up_proj": (
+            ".mlp.shared_expert.gate_up_proj", 1
+        ),
     }
 
     def __init__(
@@ -170,12 +247,18 @@ class Qwen3MoeForCausalLM(nn.Module):
         pp_size: int = 1,
         ep_rank: int = 0,
         ep_size: int = 1,
+        dispatch_backend: str = "replicated",
+        expert_capacity: int | None = None,
+        graph_safe_decode: bool = False,
+        expert_placement: dict[str, tuple[int, ...]] | None = None,
+        expert_capacity_factor: float | None = None,
+        dynamic_placement: bool = False,
     ) -> None:
         super().__init__()
-        if ep_size > 1 and pp_size > 1:
-            raise ValueError("combined PP and EP are not implemented")
         self.model = Qwen3MoeModel(
-            config, pp_rank, pp_size, ep_rank, ep_size
+            config, pp_rank, pp_size, ep_rank, ep_size,
+            dispatch_backend, expert_capacity, graph_safe_decode,
+            expert_placement, expert_capacity_factor, dynamic_placement,
         )
         self.tie_word_embeddings = config.tie_word_embeddings
         self.lm_head = (
@@ -269,12 +352,25 @@ class Qwen3MoeForCausalLM(nn.Module):
         return {
             "expert_start": first.expert_start,
             "expert_end": first.expert_end,
+            "local_expert_ids": list(first.local_expert_ids),
             "num_local_experts": first.num_local_experts,
             "expert_parameter_bytes": sum(
                 layer.expert_parameter_bytes for layer in moe_layers
             ),
             "ep_all_reduce_count": sum(
                 layer.ep_all_reduce_count for layer in moe_layers
+            ),
+            "ep_reduce_scatter_count": sum(
+                layer.ep_reduce_scatter_count for layer in moe_layers
+            ),
+            "ep_all_gather_count": sum(
+                layer.ep_all_gather_count for layer in moe_layers
+            ),
+            "ep_all_to_all_count": sum(
+                layer.ep_all_to_all_count for layer in moe_layers
+            ),
+            "ep_broadcast_count": sum(
+                layer.ep_broadcast_count for layer in moe_layers
             ),
             "dispatch_assignment_count": sum(
                 layer.dispatch_assignment_count for layer in moe_layers
@@ -284,5 +380,11 @@ class Qwen3MoeForCausalLM(nn.Module):
             ),
             "total_assignment_count": sum(
                 layer.total_assignment_count for layer in moe_layers
+            ),
+            "total_dispatch_token_count": sum(
+                layer.total_dispatch_token_count for layer in moe_layers
+            ),
+            "dropped_assignment_count": sum(
+                layer.dropped_assignment_count for layer in moe_layers
             ),
         }

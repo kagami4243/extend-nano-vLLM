@@ -12,6 +12,9 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    moe_token_counts: tuple[int, ...] | None = None
+    force_eager: bool = False
+    is_dummy: bool = False
 
 _CONTEXT = Context()
 

@@ -316,6 +316,8 @@ class Attention(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
+        if context.is_dummy:
+            return torch.zeros_like(q)
         k_cache, v_cache = self.k_cache, self.v_cache
         # Standalone model forwards (before the runner binds a cache) still
         # need ordinary causal attention, e.g. checkpoint validation.

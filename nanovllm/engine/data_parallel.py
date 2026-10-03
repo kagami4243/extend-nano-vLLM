@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import socket
 from queue import Empty
 import traceback
 
@@ -18,7 +19,8 @@ def _run_replica(
     try:
         replica_kwargs = dict(kwargs)
         master_port = replica_kwargs.get("master_port", 0)
-        if master_port:
+        shared_ep = kwargs.get("enable_expert_parallel", False) and data_parallel_size > 1
+        if master_port and not shared_ep:
             replica_kwargs["master_port"] = master_port + replica_id
         run_id = replica_kwargs.get("run_id", "")
         if run_id:
@@ -46,6 +48,7 @@ def generate_data_parallel(
     data_parallel_size=2,
     **kwargs,
 ):
+    """Offline DP; shared EP pads unequal token batches and coordinates completion."""
     if data_parallel_size < 1:
         raise ValueError("data_parallel_size must be positive")
     if data_parallel_size > len(prompts):
@@ -55,6 +58,25 @@ def generate_data_parallel(
             "data-parallel coordinates are managed by "
             "generate_data_parallel"
         )
+    if isinstance(sampling_params, list) and len(sampling_params) != len(prompts):
+        raise ValueError("sampling_params must cover every prompt")
+    kwargs = dict(kwargs)
+    if kwargs.get("enable_expert_parallel", False) and data_parallel_size > 1:
+        if len(prompts) % data_parallel_size:
+            raise ValueError("global EP requires a balanced number of requests per DP rank")
+        if any(not isinstance(prompt, list) or not prompt
+               or any(type(token) is not int for token in prompt) for prompt in prompts):
+            raise ValueError("global EP offline generation requires prompt token IDs")
+        parameters = sampling_params if isinstance(sampling_params, list) else [sampling_params]
+        if any(not parameter.ignore_eos for parameter in parameters):
+            raise ValueError("global EP requires ignore_eos=True for synchronized steps")
+        if (len({parameter.max_tokens for parameter in parameters}) != 1
+                or any(parameter.max_tokens < 1 for parameter in parameters)):
+            raise ValueError("global EP requires the same positive max_tokens on every request")
+        if not kwargs.get("master_port", 0):
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                kwargs["master_port"] = sock.getsockname()[1]
 
     assignments = [[] for _ in range(data_parallel_size)]
     for index, prompt in enumerate(prompts):
@@ -64,6 +86,10 @@ def generate_data_parallel(
     result_queue = ctx.Queue()
     processes = []
     for replica_id, indexed_prompts in enumerate(assignments):
+        replica_sampling = (
+            [sampling_params[index] for index, _ in indexed_prompts]
+            if isinstance(sampling_params, list) else sampling_params
+        )
         process = ctx.Process(
             target=_run_replica,
             args=(
@@ -71,7 +97,7 @@ def generate_data_parallel(
                 data_parallel_size,
                 model,
                 indexed_prompts,
-                sampling_params,
+                replica_sampling,
                 result_queue,
                 kwargs,
             ),

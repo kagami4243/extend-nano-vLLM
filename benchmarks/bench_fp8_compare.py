@@ -114,7 +114,7 @@ def measure_vllm(args) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="/data1/model/qwen/Qwen/Qwen3-8B")
+    parser.add_argument("--model", default="./models/Qwen3-8B")
     parser.add_argument("--prompt-tokens", type=int, default=128)
     parser.add_argument("--decode-tokens", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=1)

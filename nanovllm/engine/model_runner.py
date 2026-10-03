@@ -9,13 +9,19 @@ from nanovllm.config import Config
 from nanovllm.distributed.parallel_state import (
     destroy_model_parallel,
     get_ep_rank,
+    get_ep_group_ranks,
     get_ep_world_size,
+    get_moe_rank,
+    get_moe_world_size,
+    get_moe_group_ranks,
+    get_moe_group,
     get_pp_group_ranks,
     get_pp_last_rank,
     get_pp_next_rank,
     get_pp_prev_rank,
     get_pp_rank,
     get_pp_world_size,
+    get_replica_group,
     get_tp_group_ranks,
     get_tp_rank,
     get_tp_world_size,
@@ -24,6 +30,7 @@ from nanovllm.distributed.parallel_state import (
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.moe import ExpertParallelMoE, MOE_MAX_GRAPH_TOKENS_PER_RANK
 from nanovllm.layers.quantization import quantize_model
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -111,12 +118,15 @@ class ModelRunner:
         torch.cuda.set_device(self.device_index)
         init_method = f"tcp://{config.master_addr}:{config.master_port}"
         dist.init_process_group(
-            "nccl", init_method, world_size=self.world_size, rank=rank
+            "nccl", init_method,
+            world_size=(config.parallel_world_size if config.moe_global_dp else self.world_size),
+            rank=(self.global_rank if config.moe_global_dp else rank),
         )
         initialize_model_parallel(
             config.tensor_parallel_size,
             config.pipeline_parallel_size,
             config.enable_expert_parallel,
+            data_parallel_size=(config.data_parallel_size if config.moe_global_dp else 1),
         )
         self.pp_rank = get_pp_rank()
         self.pp_size = get_pp_world_size()
@@ -126,17 +136,27 @@ class ModelRunner:
         self.ep_size = get_ep_world_size()
         self.pipeline_send_count = 0
         self.pipeline_recv_count = 0
+        self.decode_graph_replay_count = 0
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         model_class = get_model_class(hf_config)
-        self.model = model_class(
-            hf_config,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            ep_rank=self.ep_rank,
-            ep_size=self.ep_size,
-        )
+        model_kwargs = {
+            "pp_rank": self.pp_rank,
+            "pp_size": self.pp_size,
+            "ep_rank": self.ep_rank,
+            "ep_size": self.ep_size,
+        }
+        if hf_config.model_type == "qwen3_moe":
+            model_kwargs["ep_rank"] = get_moe_rank()
+            model_kwargs["ep_size"] = get_moe_world_size()
+            model_kwargs["dispatch_backend"] = config.moe_dispatch_backend
+            model_kwargs["expert_capacity"] = config.moe_expert_capacity
+            model_kwargs["expert_capacity_factor"] = config.moe_expert_capacity_factor
+            model_kwargs["graph_safe_decode"] = not config.enforce_eager
+            model_kwargs["expert_placement"] = config.moe_placement_by_layer
+            model_kwargs["dynamic_placement"] = config.moe_dynamic_placement
+        self.model = model_class(hf_config, **model_kwargs)
         load_model(self.model, config.model)
         # Keep checkpoint loading and TP shard assembly unchanged, then replace
         # only dense LinearBase weights with the selected teaching format.
@@ -181,9 +201,9 @@ class ModelRunner:
                 self.shm = SharedMemory(
                     name=self.shm_name, create=True, size=2**20
                 )
-                dist.barrier()
+                dist.barrier(group=get_replica_group())
             else:
-                dist.barrier()
+                dist.barrier(group=get_replica_group())
                 self.shm = SharedMemory(name=self.shm_name)
                 self.loop()
 
@@ -194,7 +214,7 @@ class ModelRunner:
         try:
             if self.world_size > 1:
                 self.shm.close()
-                dist.barrier()
+                dist.barrier(group=get_replica_group())
                 if self.rank == 0:
                     try:
                         self.shm.unlink()
@@ -295,7 +315,9 @@ class ModelRunner:
         )
         num_blocks = torch.tensor(local_num_blocks, dtype=torch.int64, device="cuda")
         if self.world_size > 1:
-            dist.all_reduce(num_blocks, op=dist.ReduceOp.MIN)
+            dist.all_reduce(
+                num_blocks, op=dist.ReduceOp.MIN, group=get_replica_group()
+            )
         config.num_kvcache_blocks = num_blocks.item()
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(
@@ -341,7 +363,331 @@ class ModelRunner:
                     layer_id += 1
             assert layer_id == eagle_layers
 
+    def set_moe_input_probe(
+        self, layer_id: int, row_indices: list[int], stage: str,
+        broadcast_qnorm_input: bool = False,
+    ):
+        if broadcast_qnorm_input and (
+            stage != "q_norm_output" or self.world_size != self.ep_size
+        ):
+            raise ValueError("Q norm broadcast probe requires EP-only topology")
+        if hasattr(self, "_moe_input_probe_hook"):
+            self._moe_input_probe_hook.remove()
+        self._moe_input_probe_values = None
+        self._moe_input_probe_input_values = None
+        self._moe_input_probe_recomputed_values = None
+        self._moe_input_probe_broadcast_values = None
+        self._moe_input_probe_full_input_different_elements = None
+        self._moe_input_probe_layout = None
+        self._moe_input_probe_rows = row_indices
+        self._moe_input_probe_layer_id = layer_id
+        layer = self.model.model.layers[str(layer_id)]
+
+        def capture(_module, inputs, output=None):
+            if stage in ("q_norm_input", "q_norm_output"):
+                self._moe_input_probe_layout = {
+                    "shape": list(inputs[0].shape),
+                    "stride": list(inputs[0].stride()),
+                    "dtype": str(inputs[0].dtype),
+                }
+                self._moe_input_probe_input_values = (
+                    inputs[0].reshape(inputs[0].shape[0], -1)[row_indices]
+                    .detach().float().cpu()
+                )
+            if stage == "attn_input":
+                hidden = inputs[1]
+            elif stage == "mlp_input":
+                hidden = inputs[0]
+            elif stage == "q_norm_input":
+                hidden = inputs[0]
+            elif stage in ("q_ready", "k_ready", "v_ready"):
+                hidden = inputs[{"q_ready": 0, "k_ready": 1, "v_ready": 2}[stage]]
+            elif stage == "qkv_ready":
+                hidden = torch.cat(
+                    [value.reshape(value.shape[0], -1) for value in inputs], dim=1
+                )
+            else:
+                hidden = output
+            if stage == "layer_output":
+                hidden = hidden[0] + hidden[1]
+            hidden = hidden.reshape(hidden.shape[0], -1)
+            self._moe_input_probe_values = hidden[row_indices].detach().float().cpu()
+            if stage == "q_norm_output":
+                recomputed = _module.rms_forward(inputs[0])
+                recomputed = recomputed.reshape(recomputed.shape[0], -1)
+                self._moe_input_probe_recomputed_values = (
+                    recomputed[row_indices].detach().float().cpu()
+                )
+                if broadcast_qnorm_input:
+                    q = inputs[0]
+                    full_heads = q.stride(0) // q.stride(1)
+                    source = torch.empty(
+                        (q.shape[0], full_heads, q.shape[2]),
+                        dtype=q.dtype, device=q.device,
+                    )
+                    if self.rank == 0:
+                        source[:, :q.shape[1]].copy_(q)
+                        source[:, q.shape[1]:].zero_()
+                    dist.broadcast(source, src=0)
+                    same_q = source[:, :q.shape[1]]
+                    self._moe_input_probe_full_input_different_elements = int(
+                        torch.count_nonzero(q != same_q)
+                    )
+                    broadcast_output = _module.rms_forward(same_q)
+                    self._moe_input_probe_broadcast_values = (
+                        broadcast_output.reshape(q.shape[0], -1)[row_indices]
+                        .detach().float().cpu()
+                    )
+
+        if stage == "mlp_input":
+            self._moe_input_probe_hook = layer.mlp.register_forward_pre_hook(capture)
+        elif stage == "attn_input":
+            self._moe_input_probe_hook = layer.self_attn.register_forward_pre_hook(capture)
+        elif stage == "attn_output":
+            self._moe_input_probe_hook = layer.self_attn.register_forward_hook(capture)
+        elif stage == "qkv_output":
+            self._moe_input_probe_hook = layer.self_attn.qkv_proj.register_forward_hook(capture)
+        elif stage == "q_norm_input":
+            self._moe_input_probe_hook = layer.self_attn.q_norm.register_forward_pre_hook(capture)
+        elif stage == "q_norm_output":
+            self._moe_input_probe_hook = layer.self_attn.q_norm.register_forward_hook(capture)
+        elif stage == "flash_output":
+            self._moe_input_probe_hook = layer.self_attn.attn.register_forward_hook(capture)
+        elif stage in ("q_ready", "k_ready", "v_ready", "qkv_ready"):
+            self._moe_input_probe_hook = layer.self_attn.attn.register_forward_pre_hook(capture)
+        elif stage == "mlp_output":
+            self._moe_input_probe_hook = layer.mlp.register_forward_hook(capture)
+        elif stage == "layer_output":
+            self._moe_input_probe_hook = layer.register_forward_hook(capture)
+        else:
+            raise ValueError("unsupported MoE probe stage")
+        dist.barrier()
+
+    def collect_moe_input_probe(self):
+        self._moe_input_probe_hook.remove()
+        del self._moe_input_probe_hook
+        local = {
+            "rank": self.rank,
+            "values": self._moe_input_probe_values,
+            "input_values": self._moe_input_probe_input_values,
+            "recomputed_values": self._moe_input_probe_recomputed_values,
+            "broadcast_values": self._moe_input_probe_broadcast_values,
+            "full_input_different_elements": (
+                self._moe_input_probe_full_input_different_elements
+            ),
+            "input_layout": self._moe_input_probe_layout,
+            "q_norm_weight": self.model.model.layers[
+                str(self._moe_input_probe_layer_id)
+            ].self_attn.q_norm.weight.detach().float().cpu(),
+        }
+        gathered = [None] * self.world_size
+        dist.all_gather_object(gathered, local)
+        if self.rank != 0:
+            return None
+        reference = gathered[0]["values"]
+        return [
+            {
+                "rank": item["rank"],
+                "row_indices": self._moe_input_probe_rows,
+                "max_abs_by_row": (item["values"] - reference).abs().amax(dim=1).tolist(),
+                "different_elements_by_row": (
+                    item["values"] != reference
+                ).sum(dim=1).tolist(),
+                "q_norm_weight_different_elements": int((
+                    item["q_norm_weight"] != gathered[0]["q_norm_weight"]
+                ).sum()),
+                "input_layout": item["input_layout"],
+                "full_input_different_elements": item["full_input_different_elements"],
+                **({
+                    "input_max_abs_by_row": (
+                        item["input_values"] - gathered[0]["input_values"]
+                    ).abs().amax(dim=1).tolist(),
+                    "input_different_elements_by_row": (
+                        item["input_values"] != gathered[0]["input_values"]
+                    ).sum(dim=1).tolist(),
+                } if item["input_values"] is not None else {}),
+                **({
+                    "recompute_different_elements_by_row": (
+                        item["recomputed_values"] != item["values"]
+                    ).sum(dim=1).tolist(),
+                    "recompute_rank_different_elements_by_row": (
+                        item["recomputed_values"] != gathered[0]["recomputed_values"]
+                    ).sum(dim=1).tolist(),
+                } if item["recomputed_values"] is not None else {}),
+                **({
+                    "broadcast_rank_different_elements_by_row": (
+                        item["broadcast_values"] != gathered[0]["broadcast_values"]
+                    ).sum(dim=1).tolist(),
+                    "broadcast_vs_original_different_elements_by_row": (
+                        item["broadcast_values"] != item["values"]
+                    ).sum(dim=1).tolist(),
+                } if item["broadcast_values"] is not None else {}),
+            }
+            for item in gathered
+        ]
+
+    def set_moe_layer_rank_probe(self, row_index: int):
+        self._moe_layer_probe_values = {}
+        self._moe_layer_probe_hooks = []
+
+        def record(stage, layer_id, tensor):
+            tensor = tensor.reshape(tensor.shape[0], -1)
+            self._moe_layer_probe_values[(layer_id, stage)] = (
+                tensor[row_index].detach().float().cpu()
+            )
+
+        for layer_key, layer in self.model.model.layers.items():
+            layer_id = int(layer_key)
+
+            def before_qnorm(_module, inputs, layer_id=layer_id):
+                record("qnorm_input", layer_id, inputs[0])
+
+            def after_qnorm(_module, _inputs, output, layer_id=layer_id):
+                record("qnorm_output", layer_id, output)
+
+            def before_mlp(_module, inputs, layer_id=layer_id):
+                record("mlp_input", layer_id, inputs[0])
+
+            def after_layer(_module, _inputs, output, layer_id=layer_id):
+                record("layer_output", layer_id, output[0] + output[1])
+
+            self._moe_layer_probe_hooks.extend((
+                layer.self_attn.qkv_proj.register_forward_hook(
+                    lambda _module, _inputs, output, layer_id=layer_id:
+                    record("qkv_output", layer_id, output)
+                ),
+                layer.self_attn.q_norm.register_forward_pre_hook(before_qnorm),
+                layer.self_attn.q_norm.register_forward_hook(after_qnorm),
+                layer.self_attn.attn.register_forward_hook(
+                    lambda _module, _inputs, output, layer_id=layer_id:
+                    record("attention_kernel_output", layer_id, output)
+                ),
+                layer.self_attn.register_forward_hook(
+                    lambda _module, _inputs, output, layer_id=layer_id:
+                    record("attention_output", layer_id, output)
+                ),
+                layer.mlp.register_forward_pre_hook(before_mlp),
+                layer.mlp.register_forward_hook(
+                    lambda _module, _inputs, output, layer_id=layer_id:
+                    record("mlp_output", layer_id, output)
+                ),
+                layer.register_forward_hook(after_layer),
+            ))
+        dist.barrier()
+
+    def collect_moe_layer_rank_probe(self):
+        for hook in self._moe_layer_probe_hooks:
+            hook.remove()
+        del self._moe_layer_probe_hooks
+        gathered = [None] * self.world_size
+        dist.all_gather_object(gathered, {
+            "rank": self.rank,
+            "values": self._moe_layer_probe_values,
+        })
+        if self.rank != 0:
+            return None
+        reference = gathered[0]["values"]
+        stages = (
+            "qkv_output", "qnorm_input", "qnorm_output",
+            "attention_kernel_output", "attention_output",
+            "mlp_input", "mlp_output", "layer_output",
+        )
+        result = []
+        for item in gathered:
+            by_stage = {}
+            for stage in stages:
+                differences = []
+                for layer_id in sorted(self.model.model.layers, key=int):
+                    key = (int(layer_id), stage)
+                    delta = (item["values"][key] - reference[key]).abs()
+                    count = int(torch.count_nonzero(delta))
+                    if count:
+                        differences.append({
+                            "layer": int(layer_id),
+                            "different_elements": count,
+                            "max_abs": float(delta.max()),
+                        })
+                by_stage[stage] = {
+                    "first_difference": differences[0] if differences else None,
+                    "layers_with_differences": len(differences),
+                    "max_abs": max((row["max_abs"] for row in differences), default=0.0),
+                }
+            result.append({"rank": item["rank"], "stages": by_stage})
+        return result
+
+    def set_moe_full_norm_probe(self, layer_ids: list[int]):
+        if self.world_size != self.ep_size:
+            raise ValueError("full norm rank probe requires EP-only topology")
+        self._moe_full_norm_probe_hooks = []
+        self._moe_full_norm_probe_stats = {}
+
+        def compare(layer_id, norm_kind, point, tensor):
+            reference = (
+                tensor.contiguous().clone() if self.rank == 0
+                else torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
+            )
+            dist.broadcast(reference, src=0)
+            different = tensor != reference
+            rows = different.reshape(tensor.shape[0], -1).any(dim=1)
+            first_rows = torch.nonzero(rows).flatten()
+            self._moe_full_norm_probe_stats[f"{layer_id}.{norm_kind}.{point}"] = {
+                "different_elements": int(torch.count_nonzero(different)),
+                "different_rows": int(torch.count_nonzero(rows)),
+                "first_different_row": (
+                    int(first_rows[0]) if first_rows.numel() else None
+                ),
+                "max_abs": float((tensor.float() - reference.float()).abs().max()),
+            }
+
+        for layer_id in layer_ids:
+            layer = self.model.model.layers[str(layer_id)]
+            for norm_kind in ("q", "k"):
+                norm = getattr(layer.self_attn, f"{norm_kind}_norm")
+
+                def before(_module, inputs, layer_id=layer_id, norm_kind=norm_kind):
+                    compare(layer_id, norm_kind, "input", inputs[0])
+
+                def after(_module, _inputs, output, layer_id=layer_id,
+                          norm_kind=norm_kind):
+                    compare(layer_id, norm_kind, "output", output)
+
+                self._moe_full_norm_probe_hooks.extend((
+                    norm.register_forward_pre_hook(before),
+                    norm.register_forward_hook(after),
+                ))
+        dist.barrier()
+
+    def collect_moe_full_norm_probe(self):
+        for hook in self._moe_full_norm_probe_hooks:
+            hook.remove()
+        del self._moe_full_norm_probe_hooks
+        gathered = [None] * self.world_size
+        dist.all_gather_object(gathered, {
+            "rank": self.rank,
+            "stats": self._moe_full_norm_probe_stats,
+        })
+        return gathered if self.rank == 0 else None
+
+    def relocate_moe_experts(self, placement_by_layer):
+        if not self.config.moe_dynamic_placement:
+            raise RuntimeError("dynamic expert placement is disabled")
+        local = {}
+        for layer_id, layer in self.model.model.layers.items():
+            if isinstance(layer.mlp, ExpertParallelMoE):
+                local[layer_id] = layer.mlp.relocate_experts(
+                    placement_by_layer[layer_id]
+                )
+                self.config.moe_placement_by_layer[layer_id] = tuple(
+                    placement_by_layer[layer_id]
+                )
+        gathered = [None] * self.world_size
+        dist.all_gather_object(gathered, local)
+        return gathered if self.rank == 0 else None
+
     def get_diagnostics(self):
+        def display_rank(rank):
+            return rank if self.config.moe_global_dp else self.config.global_rank(rank)
+
         local = {
             "rank": self.rank,
             "global_rank": self.global_rank,
@@ -352,15 +698,25 @@ class ModelRunner:
             "tp_rank": get_tp_rank(),
             "tp_size": get_tp_world_size(),
             "tp_group_ranks": [
-                self.config.global_rank(rank)
+                display_rank(rank)
                 for rank in get_tp_group_ranks()
             ],
             "ep_rank": self.ep_rank,
             "ep_size": self.ep_size,
+            "ep_group_ranks": [
+                display_rank(rank)
+                for rank in get_ep_group_ranks()
+            ],
+            "moe_rank": get_moe_rank(),
+            "moe_size": get_moe_world_size(),
+            "moe_group_ranks": [
+                display_rank(rank)
+                for rank in get_moe_group_ranks()
+            ],
             "pp_rank": self.pp_rank,
             "pp_size": self.pp_size,
             "pp_group_ranks": [
-                self.config.global_rank(rank)
+                display_rank(rank)
                 for rank in get_pp_group_ranks()
             ],
             "start_layer": self.model.model.start_layer,
@@ -382,13 +738,18 @@ class ModelRunner:
             "pipeline_recv_count": self.pipeline_recv_count,
             "fp8_format": self.config.fp8_format,
             "prefill_piece_enabled": self.prefill_piece_enabled,
+            "decode_graph_replay_count": self.decode_graph_replay_count,
+            "decode_graph_batch_sizes": sorted(getattr(self, "graphs", {})),
+            "diagnostic_counters_include_graph_replays": (
+                self.decode_graph_replay_count == 0
+            ),
             "eagle3_runtime": self.get_eagle3_runtime_capabilities(),
         }
         expert_diagnostics = getattr(self.model, "get_expert_diagnostics", None)
         if expert_diagnostics is not None:
             local.update(expert_diagnostics())
         diagnostics = [None] * self.world_size
-        dist.all_gather_object(diagnostics, local)
+        dist.all_gather_object(diagnostics, local, group=get_replica_group())
         return diagnostics if self.rank == 0 else None
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -460,11 +821,9 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         cu_seqlens_k[1:] = torch.cumsum(context_lens, dim=0)
         block_tables = self.prepare_block_tables(seqs)
-        # Use the paged varlen kernel for decode as well as prefill.  This
-        # keeps the attention computation identical when speculative verify
-        # submits multiple query rows.
+        # Match the decode attention path used when capturing CUDA Graphs.
         set_context(
-            True,
+            False,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=1,
@@ -488,10 +847,14 @@ class ModelRunner:
             is_prefill
             and self.prefill_piece_enabled
             and not self.enforce_eager
+            and not get_context().force_eager
             and hasattr(getattr(self.model, "model", None), "forward_prefill_piece")
         ):
             return self.model.compute_logits(self.run_prefill_piece(input_ids, positions))
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if (
+            is_prefill or self.enforce_eager or get_context().force_eager
+            or input_ids.size(0) > MOE_MAX_GRAPH_TOKENS_PER_RANK
+        ):
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -506,6 +869,7 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
+            self.decode_graph_replay_count += 1
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def prefill_piece_cache_key(self, token_count: int) -> int:
@@ -528,7 +892,12 @@ class ModelRunner:
         positions: torch.Tensor,
         aux_hidden_state_layers=None,
     ):
-        """Capture one forward as graph segments separated by eager attention."""
+        """Capture static segments around eager attention and MoE calls."""
+        if (
+            self.config.moe_prefill_piece
+            and token_count not in self.config.moe_prefill_piece_capture_sizes
+        ):
+            return None
         variants = self.prefill_piece_graphs.setdefault(token_count, {})
         variant_key = (
             None
@@ -572,7 +941,7 @@ class ModelRunner:
         )
 
         def capture_piece_runner(kind, module, *inputs):
-            if kind == "attention":
+            if kind in ("attention", "moe"):
                 return capture.add_eager(module, *inputs)
             capture.ensure_graph()
             return self._run_prefill_piece(kind, module, *inputs)
@@ -926,7 +1295,7 @@ class ModelRunner:
             return None
 
         logits = self.model.compute_logits(hidden_states)
-        if get_tp_rank() != 0:
+        if get_tp_rank() != 0 or self.ep_rank != 0:
             return None
         token_ids = self.sampler(logits, temperatures)
         if self.rank != 0:
@@ -935,17 +1304,62 @@ class ModelRunner:
             return None
         return token_ids.tolist()
 
+    def has_unfinished_dp(self, local_unfinished: bool) -> bool:
+        device = "cuda" if dist.get_backend(get_moe_group()) == "nccl" else "cpu"
+        active = torch.tensor([int(local_unfinished)], device=device, dtype=torch.int32)
+        dist.all_reduce(active, op=dist.ReduceOp.MAX, group=get_moe_group())
+        return bool(active.item())
+
+    def coordinate_ep_batch(self, num_tokens: int, is_prefill: bool, device):
+        context = get_context()
+        variants = self.prefill_piece_graphs.get(num_tokens, {})
+        local = torch.tensor(
+            [num_tokens, int(is_prefill), int(None in variants)],
+            device=device, dtype=torch.int32,
+        )
+        gathered = torch.empty(self.ep_size * 3, device=device, dtype=torch.int32)
+        dist.all_gather_into_tensor(gathered, local, group=get_moe_group())
+        metadata = gathered.view(self.ep_size, 3).tolist()
+        tp_size = get_tp_world_size()
+        for start in range(0, self.ep_size, tp_size):
+            if any(item != metadata[start] for item in metadata[start:start + tp_size]):
+                raise RuntimeError("global EP requires matching batch metadata within each TP replica")
+        counts, phases, captured = zip(*metadata[::tp_size])
+        uneven = len(set(counts)) > 1 or 0 in counts
+        context.moe_token_counts = tuple(counts) if uneven else None
+        # A captured graph has a fixed token layout and collective sequence.
+        context.force_eager = (
+            uneven or len(set(phases)) > 1
+            or (is_prefill and len(set(captured)) > 1)
+        )
+
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         try:
-            input_ids, positions = (
-                self.prepare_prefill(seqs)
-                if is_prefill
-                else self.prepare_decode(seqs)
-            )
+            if not seqs:
+                if not self.config.moe_global_dp:
+                    raise ValueError("empty batches require coordinated global EP")
+                input_ids = torch.zeros(1, device="cuda", dtype=torch.int64)
+                positions = torch.zeros_like(input_ids)
+                set_context(True)
+                get_context().is_dummy = True
+            else:
+                input_ids, positions = (
+                    self.prepare_prefill(seqs)
+                    if is_prefill
+                    else self.prepare_decode(seqs)
+                )
+            if self.config.moe_global_dp:
+                self.coordinate_ep_batch(
+                    input_ids.numel() if seqs else 0, is_prefill, input_ids.device,
+                )
+            if not seqs:
+                with torch.inference_mode():
+                    self.model(input_ids, positions)
+                return []
             should_sample = (
                 self.is_last_pp_stage
                 and get_tp_rank() == 0
-                and self.ep_rank == 0
+                and (self.config.moe_global_dp or self.ep_rank == 0)
             )
             temperatures = self.prepare_sample(seqs) if should_sample else None
             if self.pp_size > 1:
@@ -989,7 +1403,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(config.max_num_seqs, MOE_MAX_GRAPH_TOKENS_PER_RANK)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -1038,7 +1452,10 @@ class ModelRunner:
         self.prefill_piece_enabled = bool(
             not self.enforce_eager
             and self.pp_size == 1
-            and self.config.hf_config.model_type == "qwen3"
+            and (
+                self.config.hf_config.model_type == "qwen3"
+                or self.config.moe_prefill_piece
+            )
             and hasattr(self.model.model, "forward_prefill_piece")
             # Rowwise torch._scaled_mm is unsafe in the breakable prefill
             # capture on the supported Torch/CUDA stack. Decode still uses

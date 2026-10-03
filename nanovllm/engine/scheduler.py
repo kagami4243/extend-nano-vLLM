@@ -10,6 +10,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.enable_prefill_batching = getattr(config, "enable_prefill_batching", False)
         self.num_speculative_tokens = (
             config.speculative_config.num_speculative_tokens
             if config.speculative_config is not None
@@ -37,25 +38,33 @@ class Scheduler:
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         if self.waiting and not (self.running and self.last_step_was_prefill):
-            seq = self.waiting[0]
-            if not seq.block_table:
-                if not self.block_manager.can_allocate(seq):
-                    if not self.running:
-                        raise RuntimeError("not enough KV-cache blocks for request")
-                else:
+            scheduled_seqs = []
+            token_budget = self.max_num_batched_tokens
+            for seq in self.waiting:
+                if (
+                    len(scheduled_seqs) == self.max_num_seqs
+                    or token_budget == 0
+                    or (scheduled_seqs and not self.enable_prefill_batching)
+                ):
+                    break
+                if not seq.block_table:
+                    if not self.block_manager.can_allocate(seq):
+                        if not self.running and not scheduled_seqs:
+                            raise RuntimeError("not enough KV-cache blocks for request")
+                        break
                     self.block_manager.allocate(seq)
-            if seq.block_table:
                 remaining = seq.num_tokens - seq.num_computed_tokens
-                seq.num_scheduled_tokens = min(
-                    remaining, self.max_num_batched_tokens
-                )
+                seq.num_scheduled_tokens = min(remaining, token_budget)
+                token_budget -= seq.num_scheduled_tokens
+                scheduled_seqs.append(seq)
+            if scheduled_seqs:
                 self.last_step_was_prefill = True
                 self.stats["prefill_steps"] += 1
                 self.stats["max_prefill_tokens_per_step"] = max(
                     self.stats["max_prefill_tokens_per_step"],
-                    seq.num_scheduled_tokens,
+                    self.max_num_batched_tokens - token_budget,
                 )
-                return [seq], True
+                return scheduled_seqs, True
 
         # decode
         scheduled_seqs = []
@@ -89,6 +98,7 @@ class Scheduler:
             for seq, token_id in zip(seqs, token_ids):
                 seq.num_computed_tokens += seq.num_scheduled_tokens
                 seq.num_scheduled_tokens = 0
+                self.block_manager.mark_computed(seq)
                 if not seq.is_prefill_complete:
                     continue
                 self.waiting.remove(seq)
@@ -106,6 +116,7 @@ class Scheduler:
 
         for seq, token_id in zip(seqs, token_ids):
             seq.num_computed_tokens = len(seq)
+            self.block_manager.mark_computed(seq)
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
@@ -156,6 +167,7 @@ class Scheduler:
         # The target has evaluated the current tail and accepted drafts. A
         # replacement/bonus token is an output and remains uncomputed.
         seq.num_computed_tokens = base_num_tokens + len(committed_tokens)
+        self.block_manager.mark_computed(seq)
 
         if replacement_token is not None and seq.num_completion_tokens < seq.max_tokens:
             # A replacement can cross a page boundary.  Finalize the old page

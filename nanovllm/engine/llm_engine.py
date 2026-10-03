@@ -18,12 +18,8 @@ from nanovllm.engine.speculative import verify_greedy_proposals
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
-        if "expert_parallel_size" in kwargs:
-            raise ValueError(
-                "expert_parallel_size is no longer supported; use "
-                "tensor_parallel_size together with "
-                "enable_expert_parallel=True"
-            )
+        if "moe_global_dp" in kwargs:
+            raise ValueError("EP spans DP * TP automatically; remove moe_global_dp")
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -74,6 +70,34 @@ class LLMEngine:
     def cache_stats(self):
         return self.scheduler.block_manager.stats.copy()
 
+    def relocate_experts(self, placement_by_layer: dict[str, list[int]]):
+        """Apply a new MoE placement between requests without recapturing graphs."""
+        if not self.config.moe_dynamic_placement:
+            raise RuntimeError("dynamic expert placement is disabled")
+        if not self.scheduler.is_finished():
+            raise RuntimeError("engine must be idle with no pending requests")
+        hf_config = self.config.hf_config
+        expected_layers = {
+            str(layer) for layer in range(hf_config.num_hidden_layers)
+            if layer not in getattr(hf_config, "mlp_only_layers", [])
+            and (layer + 1) % hf_config.decoder_sparse_step == 0
+        }
+        if not isinstance(placement_by_layer, dict) or set(placement_by_layer) != expected_layers:
+            raise ValueError("placement must cover every MoE layer")
+        ep_size = self.config.effective_expert_parallel_size
+        experts_per_rank = hf_config.num_experts // ep_size
+        placements = {}
+        for layer, owners in placement_by_layer.items():
+            if (not isinstance(owners, (tuple, list))
+                    or len(owners) != hf_config.num_experts
+                    or any(type(owner) is not int or not 0 <= owner < ep_size
+                           for owner in owners)
+                    or any(owners.count(rank) != experts_per_rank
+                           for rank in range(ep_size))):
+                raise ValueError(f"invalid MoE placement for layer {layer}")
+            placements[layer] = tuple(owners)
+        return self.model_runner.call("relocate_moe_experts", placements)
+
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if self.config.speculative_config is not None:
             if sampling_params.temperature != 0:
@@ -92,6 +116,9 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        if self.config.moe_global_dp and self.scheduler.is_finished():
+            self.model_runner.call("run", [], True)
+            return [], 0
         seqs, is_prefill = self.scheduler.schedule()
         scheduled_token_count = sum(seq.num_scheduled_tokens for seq in seqs)
         if self.config.speculative_config is not None and not is_prefill:
@@ -159,7 +186,10 @@ class LLMEngine:
         return outputs, num_tokens
 
     def is_finished(self):
-        return self.scheduler.is_finished()
+        local_finished = self.scheduler.is_finished()
+        if self.config.moe_global_dp:
+            return not self.model_runner.call("has_unfinished_dp", not local_finished)
+        return local_finished
 
     def generate(
         self,

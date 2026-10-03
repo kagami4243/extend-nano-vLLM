@@ -12,6 +12,7 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        self.ready = False
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -21,6 +22,7 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+        self.ready = False
 
 
 class BlockManager:
@@ -83,6 +85,7 @@ class BlockManager:
             )
             if (
                 block_id == -1
+                or not self.blocks[block_id].ready
                 or self.blocks[block_id].hash != h
                 or self.blocks[block_id].token_ids != token_ids
             ):
@@ -100,15 +103,36 @@ class BlockManager:
                     block = self.blocks[block_id]
                     block.ref_count += 1
                 else:
-                    block = self._allocate_block(block_id)
+                    block = self.blocks[block_id]
+                    self.free_block_ids.remove(block_id)
+                    self.used_block_ids.add(block_id)
+                    block.ref_count = 1
             if h != -1:
                 block.update(h, token_ids)
-                if self.enable_prefix_caching:
+                if self.enable_prefix_caching and block.ready:
                     self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
         seq.num_computed_tokens = min(
             seq.num_cached_tokens, max(seq.num_tokens - 1, 0)
         )
+
+    def mark_computed(self, seq: Sequence):
+        for index in range(min(
+            seq.num_computed_tokens // self.block_size, len(seq.block_table)
+        )):
+            block = self.blocks[seq.block_table[index]]
+            if block.ready:
+                continue
+            if block.hash == -1:
+                token_ids = seq.block(index)
+                prefix = (
+                    self.blocks[seq.block_table[index - 1]].hash
+                    if index > 0 else -1
+                )
+                block.update(self.compute_hash(token_ids, prefix), token_ids)
+            block.ready = True
+            if self.enable_prefix_caching:
+                self.hash_to_block_id[block.hash] = block.block_id
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -150,7 +174,7 @@ class BlockManager:
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
-            if self.enable_prefix_caching:
+            if self.enable_prefix_caching and last_block.ready:
                 self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
