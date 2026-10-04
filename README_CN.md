@@ -11,17 +11,99 @@
 [![Python](https://img.shields.io/badge/python-3.10--3.12-blue.svg)](pyproject.toml)
 [![CI](https://github.com/GeeeekExplorer/extend-nano-vllm/actions/workflows/quality.yml/badge.svg)](https://github.com/GeeeekExplorer/extend-nano-vllm/actions/workflows/quality.yml)
 
-## 相比 nano-vLLM 的扩展
+## 特性
 
-| 方向 | 本项目新增内容 |
-| --- | --- |
-| 模型支持 | 在 dense Qwen3 之外，支持 Qwen3-MoE 加载和 EAGLE3 draft model 执行 |
-| 并行执行 | TP/PP/DP 进程组与 EP=DP×TP，不增加独立 EP 轴 |
-| Cache 与调度 | Prefix reuse、chunked/batched prefill、跨 DP token padding/完成状态协调与 FP8 E4M3 KV cache |
-| 解码 | 支持 target/draft KV cache 协同的 greedy EAGLE3 speculative decoding |
-| 低精度 | 面向 dense Qwen3 的在线 W4A16 和 FP8 W8A8 Linear quantization，FP8 默认 per-tensor |
-| GPU kernel | Triton FP8 KV cache kernel 与紧凑 grouped MoE GEMM，Graph 下跳过无效 tile |
-| 验证 | 为新增路径提供 GPU correctness check 和独立 benchmark driver |
+以下同时列出继承自 nano-vLLM 的核心机制与本项目的扩展，并标明实验路径及当前限制。
+
+### 模型执行与生成
+
+- **Dense Qwen3 / Qwen3-MoE**：按 model_type 注册模型，加载本地 Hugging Face
+  checkpoint，并按受支持并行布局仅加载本 rank 所需权重。
+- **离线批量生成**：支持文本或 token-ID prompts、共享或逐请求 SamplingParams，
+  按输入顺序返回 text 和生成的 token_ids。
+- **Greedy 与 temperature 采样**：temperature=0 使用 argmax，正值使用类别概率采样，
+  支持 EOS 停止、max_tokens 和 ignore_eos。
+- **请求生命周期接口**：提供 add_request()、step()、is_finished()、generate()，
+  以及 exit() 显式退出与资源清理。
+
+### Attention、KV cache 与调度
+
+- **分页 KV cache**：固定 256-token block、逻辑到物理 block table、引用计数，
+  按 GPU 显存预算分配容量，decode 使用分页 attention。
+- **FlashAttention 2**：支持变长 causal prefill 与 KV-cache decode，
+  Triton kernel 将新增 K/V 写入对应物理 slot。
+- **Prefix caching**：跨请求复用计算完成的完整前缀 block，校验 hash/token 内容，
+  清理陈旧 hash，并统计命中数与复用 token 数。
+- **迭代级 decode batching**：每步批量推进活跃请求，完成后释放资源；
+  KV block 不足时抢占请求并在后续重新 prefill。
+- **Chunked prefill**：按 max_num_batched_tokens 切分长 prompt、复用已有 KV，
+  prefill 后给 running decode 请求推进机会。
+- **多请求 prefill batching**：多个 waiting 请求共享本步 token budget；
+  Qwen3-MoE 默认开启，dense Qwen3 可显式开启。
+
+### 分布式执行
+
+- **张量并行（TP）**：vocab embedding/LM head、QKV 与 dense MLP 投影分片，
+  使用显式 TP group 和 collective。
+- **流水线并行（PP）**：连续层与本地 KV 分区、stage 间传递 activation、末 stage
+  回传采样 token；当前同步执行单 microbatch，要求 eager，没有流水重叠。
+- **数据并行（DP）**：独立副本引擎、scheduler 和 KV pool，离线 round-robin
+  分发请求并恢复原输出顺序。
+- **组合并行**：支持 TP×PP 和 DP×TP；开启专家并行后自动派生 **EP=DP×TP**，
+  不增加独立进程轴。跨 DP EP 当前要求 PP=1。
+- **跨 DP EP 协调**：不同 token 数自动 padding 通信、路由前去掉填充、输出裁回；
+  先完成副本执行 dummy forward 直到全局完成，保留各副本独立的 prefix cache。
+
+### MoE 路由与专家执行
+
+- **Top-k 路由与本地专家**：FP32 softmax、可选 top-k 概率归一化、
+  本地专家权重分片和专家输出加权归并。
+- **Triton grouped GEMM**：按专家排列路由并对齐到 16 行，两次 grouped GEMM
+  计算 gate/up 和 down，GPU 执行 SwiGLU 与按路由顺序的输出归并。
+- **紧凑 Graph 专家任务**：固定容量索引、GPU 有效长度、M×top_k 行中间激活，
+  无效 GEMM tile 在加载权重和矩阵计算前退出。
+- **通信 backend**：复制输入后归约；跨 DP all-gather 后 all-reduce，或
+  reduce-scatter 加本地 TP all-gather；另有 eager all-to-all dispatch/combine 实验路径。
+- **Shared experts 与 capacity**：支持 shared-expert 执行、固定专家容量或
+  按 token 数计算的 capacity factor，以及容量溢出时的 token dropping。
+- **专家放置与迁移**：支持逐层显式 expert ownership 和 relocate_experts()
+  受控迁移；当前不支持跨 DP 动态迁移。
+
+### CUDA Graph、编译与低精度
+
+- **完整 decode CUDA Graph**：按多个 batch bucket 捕获包含 attention/MoE 的
+  forward，每 GPU 上限 512 tokens，最大配置共 36 个 Graph；
+  跨 DP MoE 汇集上限 DP×512，logits/采样在图外。
+- **Piecewise prefill CUDA Graph**：静态片段围绕 eager attention 捕获，dense
+  Qwen3 默认开启；MoE 需显式指定 capture sizes，片段之间的 attention/MoE 保持 eager。
+- **局部 torch.compile**：编译带装饰器的 normalization、activation 与 sampling
+  等算子，编译与 CUDA Graph 是独立控制的优化路径。
+- **W4A16 权重量化**：dense Qwen3 在线 group-wise packed INT4 Linear 权重，
+  activation 保持 BF16/FP16，使用 Triton GEMM。
+- **FP8 W8A8 Linear**：dense Qwen3 在线 E4M3 weight/activation，默认
+  per-tensor activation scale，可选 per-token；per-token prefill 使用 eager，decode 可用 Graph。
+- **FP8 E4M3 KV cache**：可选单 GPU 存储、Triton page 写入与 paged decode
+  attention，prefill 临时反量化后使用 FA2；教学路径要求 head_dim=128，
+  每层 K/V scale 固定为 1。
+
+### 投机解码与验证
+
+- **EAGLE3 speculative decoding**：独立 draft model、greedy proposal/target
+  verification、接受前缀与 replacement token、独立 KV 状态、checkpoint/rollback，
+  支持批量请求。当前要求 DP=TP=PP=1、关闭 prefix cache、target verification
+  eager，且不支持 FP8 KV 组合。
+- **运行诊断**：并行 rank、参数字节数、通信与 Graph replay 计数、prefix reuse
+  和 speculative acceptance 统计。
+- **Tests / benchmarks**：临时 config-only checkpoint 的 CPU 合约测试、GPU
+  layer/Graph 回归、分布式集成，以及区分 warmup 的延迟、吞吐与 GPU profile 测量。
+
+### 当前范围
+
+目标环境是 CUDA/NVIDIA 和本地 Qwen3 checkpoint。尚无 OpenAI 兼容服务、流式 API、
+ROCm/SDPA fallback、top-k/top-p 采样、自动 EPLB、CP 或 PD 分离。调度采用
+prefill/decode 阶段交替，没有同一次 forward 的混合 batch；跨 DP 不等长批次的
+本步完整 forward 回退 eager。尚不支持预量化 checkpoint 与量化 MoE，
+性能收益与长输出数值一致性需要按 workload 验证。
 
 项目聚焦本地 CUDA 推理和 Qwen3 checkpoint，是研究型代码库，不是在线服务平台。
 默认值、组合限制与验证范围见 [运行指南](docs/runtime.md)；实现完成不代表所有负载均已验收。

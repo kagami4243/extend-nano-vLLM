@@ -12,17 +12,109 @@ studying modern LLM serving systems.
 [![Python](https://img.shields.io/badge/python-3.10--3.12-blue.svg)](pyproject.toml)
 [![CI](https://github.com/GeeeekExplorer/extend-nano-vllm/actions/workflows/quality.yml/badge.svg)](https://github.com/GeeeekExplorer/extend-nano-vllm/actions/workflows/quality.yml)
 
-## Extensions over nano-vLLM
+## Features
 
-| Area | Added in this project |
-| --- | --- |
-| Model support | Qwen3-MoE model loading and EAGLE3 draft-model execution alongside dense Qwen3 |
-| Parallel execution | Tensor/pipeline/data groups and expert parallel derived as EP=DP×TP, without an independent EP axis |
-| Cache and scheduling | Prefix reuse, chunked and batched prefill, cross-DP token padding/completion coordination, and FP8 E4M3 KV-cache storage |
-| Decoding | Greedy EAGLE3 speculative decoding with target/draft KV-cache coordination |
-| Low precision | Online W4A16 and FP8 W8A8 linear quantization for dense Qwen3, with per-tensor FP8 as the default |
-| GPU kernels | Triton FP8 KV-cache kernels and compact grouped MoE GEMMs that skip inactive tiles under CUDA Graph |
-| Validation | GPU correctness checks and standalone benchmark drivers for the added paths |
+The list includes mechanisms inherited from nano-vLLM and the extensions in
+this project. Experimental paths and their current constraints are identified
+alongside each feature.
+
+### Model execution and generation
+
+- **Dense Qwen3 and Qwen3-MoE**: model-type registry, local Hugging Face
+  checkpoint loading, and per-rank weight loading for supported parallel layouts.
+- **Offline batched generation**: text or token-ID prompts, shared or per-request
+  sampling parameters, and ordered results containing text and generated token IDs.
+- **Greedy and temperature sampling**: `temperature=0` selects argmax;
+  positive temperatures use categorical sampling, with EOS and output-length limits.
+- **Request lifecycle APIs**: `add_request()`, `step()`, `is_finished()` and
+  `generate()`, plus explicit engine cleanup through `exit()`.
+
+### Attention, KV cache and scheduling
+
+- **Paged KV cache**: fixed 256-token blocks, logical-to-physical block tables,
+  reference counting, GPU-memory-based capacity allocation, and paged decode attention.
+- **FlashAttention 2**: variable-length causal prefill and KV-cache decode;
+  Triton kernels write new K/V values into physical cache slots.
+- **Prefix caching**: reuse complete computed prefix blocks across requests,
+  validate hash/token contents, remove stale entries, and report cache hits and reused tokens.
+- **Iteration-level decode batching**: advance active requests together, release
+  completed requests, and preempt/recompute requests when KV blocks are exhausted.
+- **Chunked prefill**: split long prompts by `max_num_batched_tokens`, reuse
+  existing KV, and give running decode requests a turn after a prefill step.
+- **Multi-request prefill batching**: several waiting requests can share one
+  token budget; enabled by default for MoE and opt-in for dense Qwen3.
+
+### Distributed execution
+
+- **Tensor parallelism (TP)**: shard vocab embeddings/LM head, QKV and dense
+  MLP projections, with explicit TP groups and collective operations.
+- **Pipeline parallelism (PP)**: partition consecutive layers and local KV
+  storage, transfer activations between stages, and return sampled tokens;
+  currently synchronous, one microbatch at a time, with eager execution.
+- **Data parallelism (DP)**: independent replica engines, schedulers and KV
+  pools; offline round-robin request routing and restoration of input order.
+- **Combined layouts**: support TP×PP and DP×TP; enabled expert parallelism
+  derives **EP=DP×TP**, with no additional process axis. Cross-DP EP requires PP=1.
+- **Cross-DP EP coordination**: pad unequal token counts for communication,
+  remove padding before routing, trim local outputs, and use dummy forwards on
+  early-finished replicas until global completion. Prefix caching stays enabled.
+
+### MoE routing and expert execution
+
+- **Top-k routing and local experts**: FP32 softmax, optional top-k probability
+  normalization, local expert weight shards, and weighted combination of expert outputs.
+- **Grouped Triton GEMMs**: expert-major route packing, 16-row alignment,
+  gate/up and down projections, GPU SwiGLU, and route-order output combination.
+- **Compact graph-safe expert tasks**: fixed-capacity route indices, GPU
+  effective lengths, `M*top_k` activation rows, and early exit for inactive GEMM tiles.
+- **Dispatch backends**: replicated inputs with output reduction; cross-DP
+  all-gather with all-reduce or reduce-scatter/local TP all-gather;
+  optional eager all-to-all dispatch/combine experiments.
+- **Shared experts and capacity controls**: shared-expert execution, fixed
+  per-expert capacity or a token-scaled capacity factor, and overflow token dropping.
+- **Expert placement and migration**: explicit per-layer expert ownership and
+  controlled relocation via `relocate_experts()`; cross-DP migration is unsupported.
+
+### Graphs, compilation and low precision
+
+- **Full-forward decode CUDA Graphs**: capture attention and MoE in multiple
+  batch buckets, up to 512 tokens per GPU; 36 buckets at the maximum, with
+  cross-DP MoE capacity of `DP*512`. Logits and sampling remain outside the graphs.
+- **Piecewise prefill CUDA Graphs**: capture static pieces around eager
+  attention; dense Qwen3 enables this by default, while MoE requires explicit
+  capture sizes and keeps attention/MoE calls eager between pieces.
+- **Local `torch.compile` optimization**: compile decorated normalization,
+  activation and sampling operations; graph capture and compilation are separate controls.
+- **W4A16 weight quantization**: online group-wise packed INT4 linear weights
+  for dense Qwen3, with BF16/FP16 activations and Triton GEMMs.
+- **FP8 W8A8 linear execution**: online E4M3 weights/activations for dense Qwen3,
+  with per-tensor activation scaling by default and optional per-token scaling;
+  per-token prefill is eager, while decode can use CUDA Graphs.
+- **FP8 E4M3 KV cache**: optional single-GPU storage with Triton page writes
+  and paged decode attention; prefill dequantizes KV for FlashAttention 2.
+  The teaching path uses `head_dim=128` and fixed per-layer K/V scales of 1.
+
+### Speculative decoding and validation
+
+- **EAGLE3 speculative decoding**: independent draft-model execution, greedy
+  proposal/target verification, accepted-prefix and replacement-token handling,
+  separate KV state, checkpoint/rollback, and batched request support.
+  Currently DP=TP=PP=1, prefix cache off, target verification eager, and no FP8 KV.
+- **Runtime diagnostics**: parallel ranks, parameter bytes, communication and
+  graph replay counts, prefix reuse, and speculative acceptance statistics.
+- **Tests and benchmarks**: CPU contracts with config-only checkpoints, GPU
+  layer/graph checks, distributed integration drivers, and warmup-aware latency,
+  throughput and GPU-profile measurements for supported features.
+
+### Current scope
+
+CUDA/NVIDIA and local Qwen3 checkpoints are the supported target. There is no
+OpenAI-compatible server, streaming API, ROCm/SDPA fallback, top-k/top-p sampler,
+automatic EPLB, CP or PD separation. Scheduling alternates prefill and decode
+phases rather than mixing them in one forward. Unequal cross-DP batches fall
+back to eager for the affected forward. Quantized checkpoints and quantized MoE
+are not supported; performance and long-output numerical equality require
+workload-specific verification.
 
 The implementation is intentionally focused on local CUDA inference and Qwen3
 checkpoints. It is a research codebase, not a hosted serving platform.
